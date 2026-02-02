@@ -6,11 +6,11 @@ import google.generativeai as genai
 # 1. API CONFIGURATION
 # Replace these with your actual keys
 TWELVE_DATA_KEY = "a7479c4fa2a24df483edd27fe4254de1"
-GEMINI_KEY = "YOUR_GEMINI_API_KEY"
+GEMINI_KEY = "AIzaSyAs5fIJJ9bFYiS9VxeIPrsiFW-6Gq06YbY"
 
 # Initialize Clients
 td = TDClient(apikey=TWELVE_DATA_KEY)
-genai.configure(api_key=AIzaSyAs5fIJJ9bFYiS9VxeIPrsiFW-6Gq06YbY)
+genai.configure(api_key=GEMINI_KEY)
 model = genai.GenerativeModel('gemini-1.5-flash')
 
 # 2. THE AI BRAIN FUNCTION
