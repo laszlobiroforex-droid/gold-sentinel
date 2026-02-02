@@ -16,7 +16,7 @@ model = genai.GenerativeModel('gemini-2.5-flash')
 def get_ai_advice(market, account, setup):
     prompt = f"""
     You are a strict Gold risk auditor for a RebelsFunding Phase 2 account.
-    Account Buffer above hard floor: ${account['buffer']:.2f}
+    Buffer above hard floor: ${account['buffer']:.2f}
     Market: Price ${market['price']:.2f}, RSI {market['rsi']:.1f}
     Proposed: {setup['type']} at ${setup['entry']:.2f} with ${setup['risk']:.2f} risk.
 
@@ -30,21 +30,22 @@ def get_ai_advice(market, account, setup):
 
 # ─── STREAMLIT SETUP ─────────────────────────────────────────────────────────
 st.set_page_config(page_title="Gold Sentinel Pro", page_icon="🥇", layout="wide")
-st.title("🥇 Gold Sentinel Adaptive 6.8 (Fixed)")
-st.caption("RebelsFunding Phase 2 Protector — Feb 2, 2026")
+st.title("🥇 Gold Sentinel Adaptive 6.9")
+st.caption("RebelsFunding Phase 2 Protector — Manual Entry Mode")
 
-# ─── ACCOUNT INPUTS ──────────────────────────────────────────────────────────
-st.header("Account Health")
+# ─── ACCOUNT INPUTS (DYNAMIC) ────────────────────────────────────────────────
+st.header("Step 1: Account Health")
 col1, col2 = st.columns(2)
 with col1:
-    balance = st.number_input("Current Balance ($)", min_value=4500.0, value=4616.28, step=0.01)
+    # Removed defaults - user must input
+    balance = st.number_input("Current Balance ($)", min_value=0.0, value=None, placeholder="Enter Balance...", format="%.2f")
 with col2:
-    daily_limit = st.number_input("Daily Drawdown Left ($)", min_value=0.0, value=None, placeholder="Required")
+    daily_limit = st.number_input("Daily Drawdown Left ($)", min_value=0.0, value=None, placeholder="Enter Limit...", format="%.2f")
 
-survival_floor = st.number_input("Max Overall Drawdown Floor ($)", value=4500.0)
+survival_floor = st.number_input("Max Overall Drawdown Floor ($)", value=4500.0, format="%.2f")
 
 # ─── RISK SETTINGS ───────────────────────────────────────────────────────────
-st.header("Risk Settings")
+st.header("Step 2: Risk Settings")
 risk_pct = st.slider("Risk % of Available Buffer", 3, 30, 8, step=1)
 
 if 'saved_setups' not in st.session_state:
@@ -53,15 +54,15 @@ if 'saved_setups' not in st.session_state:
 # ─── MAIN BUTTON LOGIC ───────────────────────────────────────────────────────
 if st.button("🚀 Get a Setup!", type="primary", use_container_width=True):
     if balance is None or daily_limit is None or balance <= survival_floor:
-        st.error("❌ Invalid balance. Protect the $4500 floor!")
+        st.error("❌ Please enter valid account values first. Balance must be > survival floor.")
     else:
         with st.spinner("Fetching market data..."):
             try:
-                # ─── FIX: USE EXPLICIT KWARGS FOR ALL TD CALLS ───
+                # ─── REAL-TIME PRICE ─────────────────────────────────────────────
                 price_resp = td.price(**{"symbol": "XAU/USD"}).as_json()
                 live_price = float(price_resp["price"])
 
-                # 15-min Data with named technical parameters
+                # ─── 15-MIN TIMEFRAME ────────────────────────────────────────────
                 ts_15m = td.time_series(**{"symbol": "XAU/USD", "interval": "15min", "outputsize": 200}) \
                     .with_rsi(**{}) \
                     .with_ema(**{"time_period": 200}) \
@@ -69,18 +70,26 @@ if st.button("🚀 Get a Setup!", type="primary", use_container_width=True):
                     .with_atr(**{"time_period": 14}) \
                     .as_pandas()
 
-                rsi       = ts_15m["rsi"].iloc[0]
-                atr       = ts_15m["atr"].iloc[0]
-                ema200_15 = ts_15m["ema_1"].iloc[0]
-                ema50_15  = ts_15m["ema_2"].iloc[0]
+                # --- BULLETPROOF INDICATOR MAPPING ---
+                cols = ts_15m.columns.tolist()
+                rsi_col = next((c for c in cols if 'rsi' in c.lower()), None)
+                atr_col = next((c for c in cols if 'atr' in c.lower()), None)
+                ema_cols = sorted([c for c in cols if 'ema' in c.lower()]) # Sort to match requested order (200, then 50)
 
-                # 1-hour Filter
+                rsi = ts_15m[rsi_col].iloc[0]
+                atr = ts_15m[atr_col].iloc[0]
+                ema200_15 = ts_15m[ema_cols[0]].iloc[0]
+                ema50_15  = ts_15m[ema_cols[1]].iloc[0]
+
+                # ─── 1-HOUR TIMEFRAME FILTER ─────────────────────────────────────
                 ts_1h = td.time_series(**{"symbol": "XAU/USD", "interval": "1h", "outputsize": 100}) \
                     .with_ema(**{"time_period": 200}) \
                     .as_pandas()
-                ema200_1h = ts_1h["ema_1"].iloc[0]
+                
+                ema_cols_1h = sorted([c for c in ts_1h.columns if 'ema' in c.lower()])
+                ema200_1h = ts_1h[ema_cols_1h[0]].iloc[0]
 
-                # ─── TREND ALIGNMENT ───
+                # ─── TREND ALIGNMENT CHECK ───────────────────────────────────────
                 if (live_price > ema200_15 and ema50_15 > ema200_15 and live_price > ema200_1h):
                     bias = "BULLISH"
                 elif (live_price < ema200_15 and ema50_15 < ema200_15 and live_price < ema200_1h):
@@ -89,7 +98,7 @@ if st.button("🚀 Get a Setup!", type="primary", use_container_width=True):
                     st.warning(f"🚫 No setup — trend misalignment. 1H EMA 200: ${ema200_1h:.2f}")
                     st.stop()
 
-                # ─── RISK ENGINE ───
+                # ─── RISK & POSITION CALC ────────────────────────────────────────
                 sl_dist     = round(atr * 1.5, 2)
                 spread_cost = 0.35
                 rr_ratio    = 4.0 if (rsi < 25 or rsi > 75) else 2.5 if (rsi < 35 or rsi > 65) else 1.8
@@ -98,7 +107,7 @@ if st.button("🚀 Get a Setup!", type="primary", use_container_width=True):
                 cash_risk  = min(buffer * (risk_pct / 100), daily_limit)
 
                 if rr_ratio < 1.8 or cash_risk < 20:
-                    st.warning(f"Setup skipped — low quality (${cash_risk:.2f} risk).")
+                    st.warning(f"Setup skipped — low quality/risk (${cash_risk:.2f}).")
                     st.stop()
 
                 tp_dist     = round(sl_dist * rr_ratio, 2)
@@ -109,31 +118,31 @@ if st.button("🚀 Get a Setup!", type="primary", use_container_width=True):
                 sl = round(entry - sl_dist, 2) if bias == "BULLISH" else round(entry + sl_dist, 2)
                 tp = round(entry + tp_dist, 2) if bias == "BULLISH" else round(entry - tp_dist, 2)
 
-                # DISPLAY
+                # ─── DISPLAY ───
                 st.subheader(f"Bias → {bias}")
                 if bias == "BULLISH": st.success(f"📈 BUY @ ${entry:.2f}")
                 else: st.warning(f"📉 SELL @ ${entry:.2f}")
 
-                cols = st.columns(4)
-                cols[0].metric("Lots", f"{lots:.2f}")
-                cols[1].metric("R:R", f"1:{rr_ratio}")
-                cols[2].metric("Risk $", f"${actual_risk:.2f}")
-                cols[3].metric("Buffer", f"${buffer:.2f}")
+                cols_m = st.columns(4)
+                cols_m[0].metric("Lots", f"{lots:.2f}")
+                cols_m[1].metric("R:R", f"1:{rr_ratio}")
+                cols_m[2].metric("Risk $", f"${actual_risk:.2f}")
+                cols_m[3].metric("Buffer", f"${buffer:.2f}")
 
                 st.write(f"**SL:** ${sl:.2f} | **TP:** ${tp:.2f}")
-                st.line_chart(ts_15m[['close', 'ema_1', 'ema_2']].tail(60).rename(columns={'close':'Price', 'ema_1':'EMA200', 'ema_2':'EMA50'}))
+                
+                chart_df = ts_15m[['close', ema_cols[0], ema_cols[1]]].tail(60).copy()
+                chart_df.columns = ['Price', 'EMA 200', 'EMA 50']
+                st.line_chart(chart_df)
 
-                # SAVE HISTORY
-                setup_record = {"time": datetime.utcnow().strftime("%H:%M:%S"), "bias": bias, "entry": entry, "risk": actual_risk, "rr": rr_ratio}
-                st.session_state.saved_setups.append(setup_record)
-
-                # AI AUDIT
+                # SAVE & AI
+                st.session_state.saved_setups.append({"time": datetime.utcnow().strftime("%H:%M"), "bias": bias, "entry": entry, "risk": actual_risk})
                 st.divider()
                 st.subheader("🧠 Gemini Risk Auditor")
                 st.info(get_ai_advice({"price": live_price, "rsi": rsi}, {"buffer": buffer}, {"type": bias, "entry": entry, "risk": actual_risk}))
 
             except Exception as e:
-                st.error(f"❌ Market Data Error: {str(e)}")
+                st.error(f"❌ Market data error: {str(e)}")
 
 # ─── HISTORY ───
 if st.session_state.saved_setups:
