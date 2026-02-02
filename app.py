@@ -6,7 +6,7 @@ TWELVE_DATA_API_KEY = "a7479c4fa2a24df483edd27fe4254de1" # Get yours at twelveda
 td = TDClient(apikey=TWELVE_DATA_API_KEY)
 
 # 2. THE INTERFACE
-st.title("🛡️ Sentinel: Phase 2 Recovery")
+st.title("Gold Sentinel")
 st.write("Survival Line: $4,500.00")
 
 col1, col2 = st.columns(2)
@@ -16,7 +16,7 @@ with col2:
     daily_limit = st.number_input("Daily Drawdown Left", value=25.49)
 
 # 3. THE MAGIC BUTTON
-if st.button('MATE, GIMME A SETUP!'):
+if st.button('Get SETUP!'):
     with st.spinner('Scanning the Waterfall...'):
         # A. Fetch Live Price & RSI
         ts = td.time_series(symbol="XAU/USD", interval="15min", outputsize=14).with_rsi().as_pandas()
@@ -25,7 +25,7 @@ if st.button('MATE, GIMME A SETUP!'):
         
         # B. Risk Logic
         buffer_to_death = balance - 4500
-        max_loss = min(daily_limit, buffer_to_death, 25.0) # Never risk more than $25
+        max_loss = min(daily_limit, buffer_to_death, 50.0) # Never risk more than $25
         
         # C. Strategy Decision
         st.subheader(f"Live Price: ${price:.2f} | RSI: {rsi:.1f}")
