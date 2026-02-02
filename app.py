@@ -31,7 +31,7 @@ def get_ai_advice(market, account, setup):
         return f"Brain Error: {str(e)}"
 
 # ─── STREAMLIT SETUP ─────────────────────────────────────────────────────────
-st.set_page_config(page_title="Gold Sentinel Pro", page_icon="🥇", layout="wide")
+st.set_page_config(page_title="Gold Sentinel", page_icon="🥇", layout="wide")
 st.title("🥇 Gold Sentinel Adaptive 6.9.1")
 st.caption("Secure Secrets Mode — Feb 2, 2026")
 
