@@ -4,37 +4,37 @@ from twelvedata import TDClient
 import google.generativeai as genai
 
 # 1. API CONFIGURATION
-# Replace these with your actual keys
+# MAKE SURE BOTH ARE INSIDE "QUOTES"
 TWELVE_DATA_KEY = "a7479c4fa2a24df483edd27fe4254de1"
 GEMINI_KEY = "AIzaSyAs5fIJJ9bFYiS9VxeIPrsiFW-6Gq06YbY"
 
 # Initialize Clients
 td = TDClient(apikey=TWELVE_DATA_KEY)
 genai.configure(api_key=GEMINI_KEY)
+
+# Using the 2026 Stable Flash Model
 model = genai.GenerativeModel('gemini-1.5-flash')
 
 # 2. THE AI BRAIN FUNCTION
 def get_ai_advice(market_data, account_info):
     prompt = f"""
-    You are an elite Gold trading assistant for a high-stakes Phase 2 account.
-    CONTEXT: {market_data}
-    ACCOUNT STATUS: {account_info}
-    
-    Provide a concise (3-4 sentence) strategic analysis. 
-    Focus on whether the technical setup aligns with the current 2026 market chaos.
-    Should the user take this trade or stay parked?
+    You are an elite Gold trader. 
+    Context: {market_data}
+    Account: {account_info}
+    Provide a 3-sentence risk assessment. Be blunt.
     """
     try:
         response = model.generate_content(prompt)
         return response.text
-    except:
-        return "Gemini Brain is currently offline. Stick to the Math."
+    except Exception as e:
+        # This will show you the ACTUAL error if it fails
+        return f"AI Error: {str(e)}"
 
 # 3. INTERFACE SETUP
 st.set_page_config(page_title="Gold Sentinel Pro", page_icon="🥇")
 st.title("🥇 Gold Sentinel Adaptive")
 
-# 4. STEP 1: ACCOUNT HEALTH (NO DEFAULTS)
+# 4. STEP 1: ACCOUNT HEALTH
 st.header("Step 1: Account Health")
 col1, col2 = st.columns(2)
 with col1:
@@ -55,12 +55,7 @@ if st.button('🚀 Get a Setup!'):
         st.error("❌ MATE! Enter your Balance and Daily Limit first!")
     else:
         with st.spinner('Sentinel & AI are analyzing the tape...'):
-            # Fetching fresh data with indicators
-            ts = td.time_series(
-                symbol="XAU/USD", 
-                interval="15min", 
-                outputsize=200
-            ).with_rsi().with_ema(time_period=200).with_ema(time_period=50).with_atr(time_period=14).as_pandas()
+            ts = td.time_series(symbol="XAU/USD", interval="15min", outputsize=200).with_rsi().with_ema(time_period=200).with_ema(time_period=50).with_atr(time_period=14).as_pandas()
             
             live_price = ts['close'].iloc[0]
             rsi = ts['rsi'].iloc[0]
@@ -68,59 +63,34 @@ if st.button('🚀 Get a Setup!'):
             ema_50 = ts['ema2'].iloc[0]
             atr = ts['atr'].iloc[0]
             
-            # MATH ENGINE: SL & RR
+            # MATH
             sl_dist = round(atr * 1.5, 2)
-            
-            # Confidence Logic
-            if rsi < 25 or rsi > 75:
-                rr_ratio = 4.0
-                quality = "ELITE REVERSAL"
-            elif rsi < 35 or rsi > 65:
-                rr_ratio = 2.25
-                quality = "TREND PULLBACK"
-            else:
-                rr_ratio = 1.0
-                quality = "LOW CONFIDENCE SCALP"
-                
+            rr_ratio = 4.0 if (rsi < 25 or rsi > 75) else 2.25 if (rsi < 35 or rsi > 65) else 1.0
             tp_dist = round(sl_dist * rr_ratio, 2)
-
-            # RISK CALCULATION
             buffer = balance - survival_floor
             cash_risk = min((buffer * (risk_pct / 100)), daily_limit)
             lots = max(round(cash_risk / (sl_dist * 100), 2), 0.01)
-
-            # TREND DIRECTION
             bias = "BULLISH" if live_price > ema_200 else "BEARISH"
 
             # 6. AI CONSULTATION
-            market_summary = f"Price: {live_price}, RSI: {rsi}, ATR: {atr}, Trend: {bias}"
-            account_summary = f"Buffer: ${buffer:.2f}, Risking: ${cash_risk:.2f}"
+            market_summary = f"Price: {live_price}, RSI: {rsi}, Trend: {bias}"
+            account_summary = f"Buffer: ${buffer:.2f}, Risk: ${cash_risk:.2f}"
             ai_advice = get_ai_advice(market_summary, account_summary)
 
-            # 7. OUTPUT DISPLAY
-            st.subheader(f"Setup Type: {quality}")
-            st.write(f"**Live Price:** ${live_price:.2f} | **Bias:** {bias}")
-            
-            st.divider()
-            
+            # 7. OUTPUT
+            st.subheader(f"Setup: {bias}")
             if bias == "BULLISH":
-                entry = live_price
-                sl = entry - sl_dist
-                tp = entry + tp_dist
-                st.success(f"📈 SUGGESTION: BUY @ ${entry:.2f}")
+                st.success(f"📈 BUY @ ${live_price:.2f}")
+                sl, tp = live_price - sl_dist, live_price + tp_dist
             else:
-                entry = live_price
-                sl = entry + sl_dist
-                tp = entry - tp_dist
-                st.warning(f"📉 SUGGESTION: SELL @ ${entry:.2f}")
+                st.warning(f"📉 SELL @ ${live_price:.2f}")
+                sl, tp = live_price + sl_dist, live_price - tp_dist
 
-            # KEY METRICS
             c1, c2, c3 = st.columns(3)
             c1.metric("Lots", f"{lots}")
             c2.metric("RR", f"1:{rr_ratio}")
             c3.metric("Risk $", f"${lots * sl_dist * 100:.2f}")
-            
-            st.write(f"**Stop Loss:** ${sl:.2f} | **Take Profit:** ${tp:.2f}")
+            st.write(f"**SL:** ${sl:.2f} | **TP:** ${tp:.2f}")
 
             st.divider()
             st.subheader("🧠 Gemini's Strategic Take")
