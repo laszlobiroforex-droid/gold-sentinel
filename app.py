@@ -145,9 +145,9 @@ if st.button("🚀 Get a Setup!", type="primary", use_container_width=True):
                     "studies": [],
                     "show_popup_button": false,
                     "popup_width": "1000",
-                    "popup_height": "650",
+                    "popup_height": "1650",
                     "container_id": "tradingview_widget",
-                    "height": 1500,
+                    "height": 800,
                     "width": "100%",
                     "range": "1D"
                   }
