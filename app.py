@@ -13,7 +13,7 @@ td = TDClient(apikey=TWELVE_DATA_KEY)
 genai.configure(api_key=GEMINI_KEY)
 
 # Using the 2026 Stable Flash Model
-model = genai.GenerativeModel('gemini-1.5-flash')
+model = genai.GenerativeModel('gemini-2.5-flash')
 
 # 2. THE AI BRAIN FUNCTION
 def get_ai_advice(market_data, account_info):
