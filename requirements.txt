@@ -1,5 +1,5 @@
-google-generativeai
 streamlit
 twelvedata
+google-generativeai
 pandas
 pandas_ta
