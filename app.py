@@ -1,3 +1,16 @@
+import google.generativeai as genai
+
+# Setup Gemini
+genai.configure(api_key="AIzaSyAs5fIJJ9bFYiS9VxeIPrsiFW-6Gq06YbY")
+model = genai.GenerativeModel('gemini-1.5-flash')
+
+# When you ask a question, the AI uses this:
+def get_ai_advice(context_data):
+    prompt = f"As an elite Gold trader, analyze this: {context_data}. Account Buffer: $116."
+    response = model.generate_content(prompt)
+    return response.text
+
+
 import streamlit as st
 import pandas as pd
 from twelvedata import TDClient
