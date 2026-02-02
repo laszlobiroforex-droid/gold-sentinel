@@ -1,3 +1,5 @@
 streamlit
 twelvedata
 pandas
+plotly
+pandas_ta
