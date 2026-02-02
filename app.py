@@ -37,7 +37,7 @@ def get_ai_advice(market, account, setup, extra_context):
 
 # ─── APP CONFIG ──────────────────────────────────────────────────────────────
 st.set_page_config(page_title="Gold Sentinel Pro", page_icon="🥇", layout="wide")
-st.title("🥇 Gold Sentinel Adaptive 7.3")
+st.title("🥇 Gold Sentinel Adaptive 7.4")
 st.caption(f"Phase 2 Protector | {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}")
 
 # ─── INPUTS ──────────────────────────────────────────────────────────────────
@@ -121,24 +121,21 @@ if st.button("🚀 Get a Setup!", type="primary", use_container_width=True):
 
                 st.write(f"**SL:** ${sl:.2f} | **TP:** ${tp:.2f}")
 
-                # ─── CHART – CURRENT ZONE ONLY ───────────────────────────────────
+                # ─── TIGHT CHART – CURRENT ZONE ONLY ─────────────────────────────
                 st.subheader("Current Price Action (15 min)")
-                recent_bars = 30  # ≈ 7.5 hours – change to 20–40 as needed
+                recent_bars = 15  # Tight zoom: last ~3.75 hours – change to 12 or 18 if needed
                 chart_df = ts[['close', ema200_col, ema50_col]].tail(recent_bars).copy()
                 chart_df.columns = ['Price', 'EMA 200', 'EMA 50']
-
-                # Optional: horizontal line at current price
-                # chart_df['Live Price Ref'] = live_price
 
                 st.line_chart(
                     chart_df,
                     use_container_width=True,
-                    height=400
+                    height=450
                 )
 
                 st.caption(
-                    f"Showing last {recent_bars} bars (~{recent_bars * 15 // 60} hours) – current zone only | "
-                    f"Live: ${live_price:.2f} | EMA200: ${ema200:.2f}"
+                    f"Showing only the last {recent_bars} bars (~{recent_bars * 15 // 60} hours) – current zone focus | "
+                    f"Live: ${live_price:.2f}"
                 )
 
                 # Save
