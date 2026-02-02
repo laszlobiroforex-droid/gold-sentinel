@@ -37,7 +37,7 @@ def get_ai_advice(market, account, setup, extra_context):
 
 # ─── APP CONFIG ──────────────────────────────────────────────────────────────
 st.set_page_config(page_title="Gold Sentinel Pro", page_icon="🥇", layout="wide")
-st.title("🥇 Gold Sentinel Adaptive 7.6")
+st.title("🥇 Gold Sentinel Adaptive 7.7")
 st.caption(f"Phase 2 Protector | {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}")
 
 # ─── INPUTS ──────────────────────────────────────────────────────────────────
@@ -122,7 +122,7 @@ if st.button("🚀 Get a Setup!", type="primary", use_container_width=True):
 
                 st.write(f"**SL:** ${sl:.2f} | **TP:** ${tp:.2f}")
 
-                # ─── TRADINGVIEW CHART EMBED (OANDA:XAUUSD, 15 min, compact) ─────
+                # ─── TRADINGVIEW CHART EMBED (OANDA:XAUUSD, 15 min, TALL VERSION) ─
                 st.subheader("XAU/USD 15 min (OANDA via TradingView)")
                 st.components.v1.html("""
                 <div class="tradingview-widget-container">
@@ -145,18 +145,18 @@ if st.button("🚀 Get a Setup!", type="primary", use_container_width=True):
                     "studies": [],
                     "show_popup_button": false,
                     "popup_width": "1000",
-                    "popup_height": "1550",
+                    "popup_height": "650",
                     "container_id": "tradingview_widget",
-                    "height": 1350,
+                    "height": 1500,
                     "width": "100%",
-                    "range": "1D"  // shows recent ~1 day, but you see current action
+                    "range": "1D"
                   }
                   );
                   </script>
                 </div>
-                """, height=1480)
+                """, height=1520)  # +20px buffer for caption/scroll
 
-                st.caption("Live 15-min chart from TradingView (OANDA:XAUUSD) – recent price action only")
+                st.caption("Live 15-min chart from TradingView (OANDA:XAUUSD) – tall view for detailed recent action")
 
                 # Save to history
                 setup_record = {
