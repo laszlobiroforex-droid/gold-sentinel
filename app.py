@@ -13,7 +13,7 @@ except Exception as e:
     st.error(f"❌ API setup failed: {str(e)}\nVerify secrets: TWELVE_DATA_KEY and GEMINI_KEY")
     st.stop()
 
-# ─── IMPROVED AI AUDITOR PROMPT ──────────────────────────────────────────────
+# ─── IMPROVED AI AUDITOR ─────────────────────────────────────────────────────
 def get_ai_advice(market, account, setup, extra_context):
     prompt = f"""
     SYSTEM: You are a high-stakes risk auditor for RebelsFunding Copper 5K Phase 2 challenge.
@@ -35,12 +35,12 @@ def get_ai_advice(market, account, setup, extra_context):
     except:
         return "Auditor offline — verify math manually."
 
-# ─── APP ─────────────────────────────────────────────────────────────────────
+# ─── APP CONFIG ──────────────────────────────────────────────────────────────
 st.set_page_config(page_title="Gold Sentinel Pro", page_icon="🥇", layout="wide")
-st.title("🥇 Gold Sentinel Adaptive 7.2")
+st.title("🥇 Gold Sentinel Adaptive 7.3")
 st.caption(f"Phase 2 Protector | {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}")
 
-# Inputs
+# ─── INPUTS ──────────────────────────────────────────────────────────────────
 st.header("Account Health")
 col1, col2 = st.columns(2)
 with col1:
@@ -51,35 +51,35 @@ with col2:
 survival_floor = st.number_input("Max Drawdown Floor ($)", value=4500.0, format="%.2f")
 
 st.header("Risk Settings")
-risk_pct = st.slider("Risk % of Buffer", 10, 50, 25, step=5)  # min 10% to match your aggressive style
+risk_pct = st.slider("Risk % of Buffer", 10, 50, 25, step=5)
 
 if 'saved_setups' not in st.session_state:
     st.session_state.saved_setups = []
 
-# Execution
+# ─── MAIN LOGIC ──────────────────────────────────────────────────────────────
 if st.button("🚀 Get a Setup!", type="primary", use_container_width=True):
     if balance is None or daily_limit is None or balance <= survival_floor:
         st.error("❌ Enter valid account values!")
     else:
         with st.spinner("Fetching XAU/USD data..."):
             try:
-                # Price fetch (kwargs safe)
+                # Price fetch
                 price_data = td.price(**{"symbol": "XAU/USD"}).as_json()
                 live_price = float(price_data["price"])
 
-                # Time series (explicit kwargs + time_period)
+                # Time series
                 ts = td.time_series(**{
                     "symbol": "XAU/USD",
                     "interval": "15min",
                     "outputsize": 100
                 }).with_rsi(**{}).with_ema(**{"time_period": 200}).with_ema(**{"time_period": 50}).with_atr(**{"time_period": 14}).as_pandas()
 
-                # Safe column extraction
+                # Column extraction
                 rsi_col  = next(c for c in ts.columns if 'rsi'  in c.lower())
                 atr_col  = next(c for c in ts.columns if 'atr'  in c.lower())
                 ema_cols = sorted([c for c in ts.columns if 'ema' in c.lower()])
-                ema200_col = ema_cols[0]  # first EMA = 200
-                ema50_col  = ema_cols[1]  # second = 50
+                ema200_col = ema_cols[0]
+                ema50_col  = ema_cols[1]
 
                 rsi    = ts[rsi_col].iloc[0]
                 atr    = ts[atr_col].iloc[0]
@@ -95,9 +95,8 @@ if st.button("🚀 Get a Setup!", type="primary", use_container_width=True):
                 buffer     = balance - survival_floor
                 cash_risk  = min(buffer * (risk_pct / 100), daily_limit)
 
-                # Gate: prevent unexecutable tiny risks
                 if cash_risk < 20 or rr_ratio < 1.8:
-                    st.warning(f"Risk ${cash_risk:.2f} too small for min lot (0.01) or RR weak — skipping.")
+                    st.warning(f"Risk ${cash_risk:.2f} too small for min lot or RR weak — skipping.")
                     st.stop()
 
                 lots        = max(round(cash_risk / ((sl_dist + spread) * 100), 2), 0.01)
@@ -122,11 +121,25 @@ if st.button("🚀 Get a Setup!", type="primary", use_container_width=True):
 
                 st.write(f"**SL:** ${sl:.2f} | **TP:** ${tp:.2f}")
 
-                # Chart
-                chart_df = ts[['close', ema200_col, ema50_col]].tail(50).rename(
-                    columns={'close': 'Price', ema200_col: 'EMA200', ema50_col: 'EMA50'}
+                # ─── CHART – CURRENT ZONE ONLY ───────────────────────────────────
+                st.subheader("Current Price Action (15 min)")
+                recent_bars = 30  # ≈ 7.5 hours – change to 20–40 as needed
+                chart_df = ts[['close', ema200_col, ema50_col]].tail(recent_bars).copy()
+                chart_df.columns = ['Price', 'EMA 200', 'EMA 50']
+
+                # Optional: horizontal line at current price
+                # chart_df['Live Price Ref'] = live_price
+
+                st.line_chart(
+                    chart_df,
+                    use_container_width=True,
+                    height=400
                 )
-                st.line_chart(chart_df)
+
+                st.caption(
+                    f"Showing last {recent_bars} bars (~{recent_bars * 15 // 60} hours) – current zone only | "
+                    f"Live: ${live_price:.2f} | EMA200: ${ema200:.2f}"
+                )
 
                 # Save
                 setup_record = {
@@ -138,7 +151,7 @@ if st.button("🚀 Get a Setup!", type="primary", use_container_width=True):
                 }
                 st.session_state.saved_setups.append(setup_record)
 
-                # Auditor (now with extra context)
+                # Auditor
                 st.divider()
                 st.subheader("🧠 Gemini Auditor")
                 market_data = {"price": live_price, "rsi": rsi}
@@ -148,9 +161,9 @@ if st.button("🚀 Get a Setup!", type="primary", use_container_width=True):
                 st.info(get_ai_advice(market_data, account_data, setup_data, extra))
 
             except Exception as e:
-                st.error(f"Market error: {str(e)}\n(Try refreshing or check API/rate limits)")
+                st.error(f"Market error: {str(e)}\n(Try refreshing or check rate limits)")
 
-# History
+# ─── HISTORY ─────────────────────────────────────────────────────────────────
 st.divider()
 st.subheader("Recent Setups")
 if st.session_state.saved_setups:
