@@ -1,51 +1,60 @@
-import google.generativeai as genai
-
-# Setup Gemini
-genai.configure(api_key="AIzaSyAs5fIJJ9bFYiS9VxeIPrsiFW-6Gq06YbY")
-model = genai.GenerativeModel('gemini-1.5-flash')
-
-# When you ask a question, the AI uses this:
-def get_ai_advice(context_data):
-    prompt = f"As an elite Gold trader, analyze this: {context_data}. Account Buffer: $116."
-    response = model.generate_content(prompt)
-    return response.text
-
-
 import streamlit as st
 import pandas as pd
 from twelvedata import TDClient
+import google.generativeai as genai
 
-# 1. INITIALIZATION
-TWELVE_DATA_API_KEY = "a7479c4fa2a24df483edd27fe4254de1"
-td = TDClient(apikey=TWELVE_DATA_API_KEY)
+# 1. API CONFIGURATION
+# Replace these with your actual keys
+TWELVE_DATA_KEY = "a7479c4fa2a24df483edd27fe4254de1"
+GEMINI_KEY = "YOUR_GEMINI_API_KEY"
 
-st.set_page_config(page_title="Gold Sentinel Adaptive", page_icon="🥇")
+# Initialize Clients
+td = TDClient(apikey=TWELVE_DATA_KEY)
+genai.configure(api_key=AIzaSyAs5fIJJ9bFYiS9VxeIPrsiFW-6Gq06YbY)
+model = genai.GenerativeModel('gemini-1.5-flash')
+
+# 2. THE AI BRAIN FUNCTION
+def get_ai_advice(market_data, account_info):
+    prompt = f"""
+    You are an elite Gold trading assistant for a high-stakes Phase 2 account.
+    CONTEXT: {market_data}
+    ACCOUNT STATUS: {account_info}
+    
+    Provide a concise (3-4 sentence) strategic analysis. 
+    Focus on whether the technical setup aligns with the current 2026 market chaos.
+    Should the user take this trade or stay parked?
+    """
+    try:
+        response = model.generate_content(prompt)
+        return response.text
+    except:
+        return "Gemini Brain is currently offline. Stick to the Math."
+
+# 3. INTERFACE SETUP
+st.set_page_config(page_title="Gold Sentinel Pro", page_icon="🥇")
 st.title("🥇 Gold Sentinel Adaptive")
 
-# 2. INPUTS - MANUAL ENTRY (No Defaults)
+# 4. STEP 1: ACCOUNT HEALTH (NO DEFAULTS)
 st.header("Step 1: Account Health")
 col1, col2 = st.columns(2)
 with col1:
-    balance = st.number_input("Current Balance ($)", value=None, placeholder="Enter Balance...")
+    balance = st.number_input("Current Balance ($)", value=None, placeholder="Type Balance...")
 with col2:
-    daily_limit = st.number_input("Daily Drawdown Left ($)", value=None, placeholder="Enter Limit...")
+    daily_limit = st.number_input("Daily Drawdown Left ($)", value=None, placeholder="Type Limit...")
 
 survival_floor = st.number_input("Max Overall Drawdown Line ($)", value=4500.0)
 
 st.header("Step 2: Risk Strategy")
-risk_pct_of_buffer = st.slider("Risk % of Remaining Buffer", 5, 50, 30)
+risk_pct = st.slider("Risk % of Remaining Buffer", 5, 50, 30)
 
 st.divider()
 
-# 3. TRIGGER: FETCH FRESH DATA
+# 5. STEP 3: THE EXECUTION
 if st.button('🚀 Get a Setup!'):
-    # Validation Check: Ensure user entered their data
     if balance is None or daily_limit is None:
         st.error("❌ MATE! Enter your Balance and Daily Limit first!")
     else:
-        with st.spinner('Analyzing Volatility & Trend...'):
-            available_buffer = balance - survival_floor
-            
+        with st.spinner('Sentinel & AI are analyzing the tape...'):
             # Fetching fresh data with indicators
             ts = td.time_series(
                 symbol="XAU/USD", 
@@ -59,52 +68,60 @@ if st.button('🚀 Get a Setup!'):
             ema_50 = ts['ema2'].iloc[0]
             atr = ts['atr'].iloc[0]
             
-            # 4. VOLATILITY-BASED STOP LOSS
-            sl_distance = round(atr * 1.5, 2)
+            # MATH ENGINE: SL & RR
+            sl_dist = round(atr * 1.5, 2)
             
-            # 5. DYNAMIC RR LOGIC
+            # Confidence Logic
             if rsi < 25 or rsi > 75:
                 rr_ratio = 4.0
-                setup_quality = "ELITE (High RR Reversal)"
+                quality = "ELITE REVERSAL"
             elif rsi < 35 or rsi > 65:
                 rr_ratio = 2.25
-                setup_quality = "STRONG (Trend Continuation)"
+                quality = "TREND PULLBACK"
             else:
                 rr_ratio = 1.0
-                setup_quality = "SCALP (Low Confidence)"
+                quality = "LOW CONFIDENCE SCALP"
                 
-            tp_distance = round(sl_distance * rr_ratio, 2)
+            tp_dist = round(sl_dist * rr_ratio, 2)
 
-            # 6. POSITION SIZING
-            cash_risk = min((available_buffer * (risk_pct_of_buffer / 100)), daily_limit)
-            calculated_lots = cash_risk / (sl_distance * 100)
-            final_lots = max(round(calculated_lots, 2), 0.01)
+            # RISK CALCULATION
+            buffer = balance - survival_floor
+            cash_risk = min((buffer * (risk_pct / 100)), daily_limit)
+            lots = max(round(cash_risk / (sl_dist * 100), 2), 0.01)
 
-            # 7. DIRECTIONAL BIAS
-            trend_bias = "BULLISH" if live_price > ema_200 else "BEARISH"
+            # TREND DIRECTION
+            bias = "BULLISH" if live_price > ema_200 else "BEARISH"
 
-            # 8. OUTPUT
-            st.subheader(f"Setup Type: {setup_quality}")
-            st.write(f"**Price:** ${live_price:.2f} | **Trend:** {trend_bias}")
+            # 6. AI CONSULTATION
+            market_summary = f"Price: {live_price}, RSI: {rsi}, ATR: {atr}, Trend: {bias}"
+            account_summary = f"Buffer: ${buffer:.2f}, Risking: ${cash_risk:.2f}"
+            ai_advice = get_ai_advice(market_summary, account_summary)
+
+            # 7. OUTPUT DISPLAY
+            st.subheader(f"Setup Type: {quality}")
+            st.write(f"**Live Price:** ${live_price:.2f} | **Bias:** {bias}")
             
             st.divider()
             
-            if trend_bias == "BULLISH":
-                entry_price = live_price
-                sl_price = entry_price - sl_distance
-                tp_price = entry_price + tp_distance
-                st.success(f"📈 SUGGESTION: BUY @ ${entry_price:.2f}")
+            if bias == "BULLISH":
+                entry = live_price
+                sl = entry - sl_dist
+                tp = entry + tp_dist
+                st.success(f"📈 SUGGESTION: BUY @ ${entry:.2f}")
             else:
-                entry_price = live_price
-                sl_price = entry_price + sl_distance
-                tp_price = entry_price - tp_distance
-                st.warning(f"📉 SUGGESTION: SELL @ ${entry_price:.2f}")
+                entry = live_price
+                sl = entry + sl_dist
+                tp = entry - tp_dist
+                st.warning(f"📉 SUGGESTION: SELL @ ${entry:.2f}")
 
-            # FINAL METRICS
-            col_lots, col_rr, col_risk = st.columns(3)
-            col_lots.metric("Lots", f"{final_lots}")
-            col_rr.metric("RR Ratio", f"1:{rr_ratio}")
-            col_risk.metric("Total Risk", f"${final_lots * sl_distance * 100:.2f}")
+            # KEY METRICS
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Lots", f"{lots}")
+            c2.metric("RR", f"1:{rr_ratio}")
+            c3.metric("Risk $", f"${lots * sl_dist * 100:.2f}")
             
-            st.write(f"**Stop Loss:** ${sl_price:.2f}")
-            st.write(f"**Take Profit:** ${tp_price:.2f}")
+            st.write(f"**Stop Loss:** ${sl:.2f} | **Take Profit:** ${tp:.2f}")
+
+            st.divider()
+            st.subheader("🧠 Gemini's Strategic Take")
+            st.info(ai_advice)
