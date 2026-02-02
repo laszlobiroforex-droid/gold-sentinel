@@ -37,7 +37,7 @@ def get_ai_advice(market, account, setup, extra_context):
 
 # ─── APP CONFIG ──────────────────────────────────────────────────────────────
 st.set_page_config(page_title="Gold Sentinel Pro", page_icon="🥇", layout="wide")
-st.title("🥇 Gold Sentinel Adaptive 7.4")
+st.title("🥇 Gold Sentinel Adaptive 7.5")
 st.caption(f"Phase 2 Protector | {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}")
 
 # ─── INPUTS ──────────────────────────────────────────────────────────────────
@@ -67,19 +67,24 @@ if st.button("🚀 Get a Setup!", type="primary", use_container_width=True):
                 price_data = td.price(**{"symbol": "XAU/USD"}).as_json()
                 live_price = float(price_data["price"])
 
-                # Time series
+                # Time series – get more bars so EMAs are fully calculated
                 ts = td.time_series(**{
                     "symbol": "XAU/USD",
                     "interval": "15min",
-                    "outputsize": 100
+                    "outputsize": 200   # more history so EMAs are valid earlier
                 }).with_rsi(**{}).with_ema(**{"time_period": 200}).with_ema(**{"time_period": 50}).with_atr(**{"time_period": 14}).as_pandas()
 
                 # Column extraction
-                rsi_col  = next(c for c in ts.columns if 'rsi'  in c.lower())
-                atr_col  = next(c for c in ts.columns if 'atr'  in c.lower())
-                ema_cols = sorted([c for c in ts.columns if 'ema' in c.lower()])
-                ema200_col = ema_cols[0]
-                ema50_col  = ema_cols[1]
+                rsi_col  = next((c for c in ts.columns if 'rsi'  in c.lower()), None)
+                atr_col  = next((c for c in ts.columns if 'atr'  in c.lower()), None)
+                ema_cols = [c for c in ts.columns if 'ema' in c.lower()]
+                ema_cols.sort()  # ema_1 = 200, ema_2 = 50 usually
+                ema200_col = ema_cols[0] if len(ema_cols) > 0 else None
+                ema50_col  = ema_cols[1] if len(ema_cols) > 1 else None
+
+                if not all([rsi_col, atr_col, ema200_col, ema50_col]):
+                    st.error("Indicator columns missing – API response issue")
+                    st.stop()
 
                 rsi    = ts[rsi_col].iloc[0]
                 atr    = ts[atr_col].iloc[0]
@@ -96,7 +101,7 @@ if st.button("🚀 Get a Setup!", type="primary", use_container_width=True):
                 cash_risk  = min(buffer * (risk_pct / 100), daily_limit)
 
                 if cash_risk < 20 or rr_ratio < 1.8:
-                    st.warning(f"Risk ${cash_risk:.2f} too small for min lot or RR weak — skipping.")
+                    st.warning(f"Risk ${cash_risk:.2f} too small for min lot or RR weak – skipping.")
                     st.stop()
 
                 lots        = max(round(cash_risk / ((sl_dist + spread) * 100), 2), 0.01)
@@ -106,7 +111,7 @@ if st.button("🚀 Get a Setup!", type="primary", use_container_width=True):
                 sl = round(entry - sl_dist, 2) if bias == "BULLISH" else round(entry + sl_dist, 2)
                 tp = round(entry + (sl_dist * rr_ratio), 2) if bias == "BULLISH" else round(entry - (sl_dist * rr_ratio), 2)
 
-                # Output
+                # ─── OUTPUT ──────────────────────────────────────────────────────
                 st.subheader(f"Bias: {bias}")
                 if bias == "BULLISH":
                     st.success(f"📈 BUY @ ${entry:.2f}")
@@ -121,11 +126,26 @@ if st.button("🚀 Get a Setup!", type="primary", use_container_width=True):
 
                 st.write(f"**SL:** ${sl:.2f} | **TP:** ${tp:.2f}")
 
-                # ─── TIGHT CHART – CURRENT ZONE ONLY ─────────────────────────────
+                # ─── TIGHT CHART – ONLY VALID RECENT DATA ────────────────────────
                 st.subheader("Current Price Action (15 min)")
-                recent_bars = 15  # Tight zoom: last ~3.75 hours – change to 12 or 18 if needed
-                chart_df = ts[['close', ema200_col, ema50_col]].tail(recent_bars).copy()
-                chart_df.columns = ['Price', 'EMA 200', 'EMA 50']
+
+                # Select columns we want
+                plot_cols = ['close', ema200_col, ema50_col]
+                chart_df = ts[plot_cols].copy()
+
+                # Drop rows where any EMA is NaN (early bars where EMA not yet calculated)
+                chart_df = chart_df.dropna()
+
+                # Now take only the most recent N valid bars
+                recent_bars = 15
+                chart_df = chart_df.tail(recent_bars)
+
+                # Rename for legend
+                chart_df = chart_df.rename(columns={
+                    'close': 'Price',
+                    ema200_col: 'EMA 200',
+                    ema50_col: 'EMA 50'
+                })
 
                 st.line_chart(
                     chart_df,
@@ -134,11 +154,11 @@ if st.button("🚀 Get a Setup!", type="primary", use_container_width=True):
                 )
 
                 st.caption(
-                    f"Showing only the last {recent_bars} bars (~{recent_bars * 15 // 60} hours) – current zone focus | "
-                    f"Live: ${live_price:.2f}"
+                    f"Last {len(chart_df)} valid bars (EMAs fully calculated) – current zone only | "
+                    f"Live price: ${live_price:.2f}"
                 )
 
-                # Save
+                # Save to history
                 setup_record = {
                     "time": datetime.utcnow().strftime("%H:%M UTC"),
                     "bias": bias,
@@ -158,7 +178,7 @@ if st.button("🚀 Get a Setup!", type="primary", use_container_width=True):
                 st.info(get_ai_advice(market_data, account_data, setup_data, extra))
 
             except Exception as e:
-                st.error(f"Market error: {str(e)}\n(Try refreshing or check rate limits)")
+                st.error(f"Market error: {str(e)}\nTry refreshing or check rate limits")
 
 # ─── HISTORY ─────────────────────────────────────────────────────────────────
 st.divider()
