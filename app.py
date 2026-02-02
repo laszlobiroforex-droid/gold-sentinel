@@ -37,7 +37,7 @@ def get_ai_advice(market, account, setup, extra_context):
 
 # ─── APP CONFIG ──────────────────────────────────────────────────────────────
 st.set_page_config(page_title="Gold Sentinel Pro", page_icon="🥇", layout="wide")
-st.title("🥇 Gold Sentinel Adaptive 7.7")
+st.title("🥇 Gold Sentinel Adaptive 7.8")
 st.caption(f"Phase 2 Protector | {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}")
 
 # ─── INPUTS ──────────────────────────────────────────────────────────────────
@@ -67,7 +67,7 @@ if st.button("🚀 Get a Setup!", type="primary", use_container_width=True):
                 price_data = td.price(**{"symbol": "XAU/USD"}).as_json()
                 live_price = float(price_data["price"])
 
-                # Time series (still needed for RSI, ATR, EMAs in logic & auditor)
+                # Time series (for RSI, ATR, EMAs used in logic & auditor)
                 ts = td.time_series(**{
                     "symbol": "XAU/USD",
                     "interval": "15min",
@@ -122,41 +122,7 @@ if st.button("🚀 Get a Setup!", type="primary", use_container_width=True):
 
                 st.write(f"**SL:** ${sl:.2f} | **TP:** ${tp:.2f}")
 
-                # ─── TRADINGVIEW CHART EMBED (OANDA:XAUUSD, 15 min, TALL VERSION) ─
-                st.subheader("XAU/USD 15 min (OANDA via TradingView)")
-                st.components.v1.html("""
-                <div class="tradingview-widget-container">
-                  <div id="tradingview_widget"></div>
-                  <script type="text/javascript" src="https://s3.tradingview.com/tv.js"></script>
-                  <script type="text/javascript">
-                  new TradingView.widget(
-                  {
-                    "autosize": true,
-                    "symbol": "OANDA:XAUUSD",
-                    "interval": "15",
-                    "timezone": "Etc/UTC",
-                    "theme": "dark",
-                    "style": "1",
-                    "locale": "en",
-                    "toolbar_bg": "#f1f3f6",
-                    "enable_publishing": false,
-                    "allow_symbol_change": false,
-                    "hide_side_toolbar": true,
-                    "studies": [],
-                    "show_popup_button": false,
-                    "popup_width": "1000",
-                    "popup_height": "1650",
-                    "container_id": "tradingview_widget",
-                    "height": 800,
-                    "width": "100%",
-                    "range": "1D"
-                  }
-                  );
-                  </script>
-                </div>
-                """, height=1520)  # +20px buffer for caption/scroll
-
-                st.caption("Live 15-min chart from TradingView (OANDA:XAUUSD) – tall view for detailed recent action")
+                # No chart section at all
 
                 # Save to history
                 setup_record = {
