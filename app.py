@@ -145,16 +145,16 @@ if st.button("🚀 Get a Setup!", type="primary", use_container_width=True):
                     "studies": [],
                     "show_popup_button": false,
                     "popup_width": "1000",
-                    "popup_height": "650",
+                    "popup_height": "1550",
                     "container_id": "tradingview_widget",
-                    "height": 450,
+                    "height": 1350,
                     "width": "100%",
                     "range": "1D"  // shows recent ~1 day, but you see current action
                   }
                   );
                   </script>
                 </div>
-                """, height=480)
+                """, height=1480)
 
                 st.caption("Live 15-min chart from TradingView (OANDA:XAUUSD) – recent price action only")
 
