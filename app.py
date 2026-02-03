@@ -34,9 +34,9 @@ def get_fractal_levels(df, window=5):
 def get_ai_advice(market, setup, levels, buffer, mode):
     levels_str = ", ".join([f"{l[0]}@{l[1]}" for l in levels[-5:]]) if levels else "No clear levels"
     prompt = f"""
-    You are a high-conviction gold trading auditor for any account size.
+    High-conviction gold trading auditor for any account size.
     Mode: {mode} ({'standard swing (15m + 1h)' if mode == 'Standard' else 'fast scalp (15m + 5m)'}).
-    Aggressive risk is user's choice — do NOT suggest reducing % risk.
+    Aggressive risk is user's choice — do NOT suggest reducing %.
     Focus on math, pullback quality, structural confluence, risk/reward.
     IMPORTANT: For buys, SL must be BELOW entry. For sells, SL must be ABOVE entry.
 
@@ -213,7 +213,7 @@ else:
 
                 risk_dist = entry - sl
                 reward_dist = tp - entry
-                actual_rr = reward_dist / risk_dist if risk_dist > 0 else 0
+                actual_rr = (reward_dist / risk_dist) if risk_dist > 0 else 0.0
                 
                 if actual_rr < min_rr:
                     st.warning(f"Reward:risk too low ({actual_rr:.2f}:1) – setup skipped")
@@ -237,4 +237,92 @@ else:
 
                 risk_dist = sl - entry
                 reward_dist = entry - tp
-                actual_rr = reward_dist /
+                actual_rr = (reward_dist / risk_dist) if risk_dist > 0 else 0.0
+                
+                if actual_rr < min_rr:
+                    st.warning(f"Reward:risk too low ({actual_rr:.2f}:1) – setup skipped")
+                    st.stop()
+
+                action_header = "SELL AT MARKET" if entry == live_price else "SELL LIMIT ORDER"
+
+            # ─── RISK & SAFETY ───────────────────────────────────────────────────
+            buffer = st.session_state.balance - st.session_state.floor
+            cash_risk = min(buffer * (st.session_state.risk_pct / 100), st.session_state.daily_limit or buffer)
+
+            if cash_risk < 20:
+                st.warning("Calculated risk too small for minimum lot size – skipping")
+                st.stop()
+
+            sl_dist_actual = abs(entry - sl)
+            lots = max(round(cash_risk / ((sl_dist_actual + 0.35) * 100), 2), 0.01)
+            actual_risk = round(lots * (sl_dist_actual + 0.35) * 100, 2)
+
+            # ─── AI OPINIONS FIRST ───────────────────────────────────────────────
+            st.divider()
+            st.subheader("AI Opinions")
+            market = {"price": live_price, "rsi": rsi}
+            setup = {"type": bias, "entry": entry, "risk": actual_risk}
+            g_verdict, k_verdict = get_ai_advice(market, setup, levels, buffer, st.session_state.mode)
+
+            col_g, col_k = st.columns(2)
+            with col_g:
+                st.markdown("**Gemini (Cautious)**")
+                st.info(g_verdict)
+            with col_k:
+                st.markdown("**Grok (Direct)**")
+                st.info(k_verdict)
+
+            st.caption("AI opinions are probabilistic assessments, not trading signals.")
+
+            # ─── ACTION BOX AFTER AI ─────────────────────────────────────────────
+            st.divider()
+            st.markdown(f"### {action_header}")
+            with st.container(border=True):
+                st.metric("Entry", f"${entry:.2f}")
+                col_sl, col_tp = st.columns(2)
+                col_sl.metric("Stop Loss", f"${sl:.2f}")
+                col_tp.metric("Take Profit", f"${tp:.2f}")
+                col_lots, col_risk = st.columns(2)
+                col_lots.metric("Lots", f"{lots:.2f}")
+                col_risk.metric("Risk Amount", f"${actual_risk:.2f}")
+                col_rr = st.columns(1)[0]
+                col_rr.metric("Actual R:R", f"1:{actual_rr:.2f}")
+
+            # Levels
+            with st.expander("Detected Fractal Levels"):
+                st.write("**Resistance above:**", resistances[:3] or "None nearby")
+                st.write("**Support below:**", supports[:3] or "None nearby")
+
+            # Accept button (placeholder)
+            if st.button("✅ Accept This Setup"):
+                st.success("Setup accepted! (Notification pause logic can be added in PWA version)")
+
+            # Save to history
+            st.session_state.saved_setups.append({
+                "time": datetime.utcnow().strftime("%H:%M UTC"),
+                "mode": st.session_state.mode,
+                "bias": bias,
+                "entry": round(entry, 2),
+                "sl": round(sl, 2),
+                "tp": round(tp, 2),
+                "lots": lots,
+                "risk": actual_risk,
+                "rr": actual_rr
+            })
+
+        except Exception as e:
+            st.error(f"Error: {str(e)}")
+
+# ─── HISTORY ─────────────────────────────────────────────────────────────────
+st.divider()
+st.subheader("Recent Setups")
+if st.session_state.saved_setups:
+    df = pd.DataFrame(st.session_state.saved_setups)
+    st.dataframe(df.sort_values("time", ascending=False).head(10), use_container_width=True, hide_index=True)
+else:
+    st.info("No setups saved yet.")
+
+# Reset button
+if st.button("Reset & Enter New Account Settings"):
+    st.session_state.analysis_done = False
+    st.rerun()
