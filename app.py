@@ -17,7 +17,7 @@ try:
         base_url="https://api.x.ai/v1",
     )
 except Exception as e:
-    st.error(f"API setup failed: {e}")
+    st.error(f"API setup failed: {e}\nCheck secrets: TWELVE_DATA_KEY, GEMINI_KEY, GROK_API_KEY")
     st.stop()
 
 # ─── FRACTAL LEVELS ──────────────────────────────────────────────────────────
@@ -32,22 +32,25 @@ def get_fractal_levels(df, window=5):
 
 # ─── DUAL AUDITORS ───────────────────────────────────────────────────────────
 def get_ai_advice(market, setup, levels):
-    levels_str = ", ".join([f"{l[0]}@{l[1]}" for l in levels[-5:]])
+    levels_str = ", ".join([f"{l[0]}@{l[1]}" for l in levels[-5:]]) if levels else "No clear levels detected"
     prompt = f"Prop Auditor: Price ${market['price']:.2f}, RSI {market['rsi']:.1f}. Levels: {levels_str}. Setup: {setup}. Audit risk vs structure. 2 sentences."
     
     # Gemini
-    try: g_out = gemini_model.generate_content(prompt).text.strip()
-    except: g_out = "Gemini Offline."
+    try:
+        g_out = gemini_model.generate_content(prompt).text.strip()
+    except:
+        g_out = "Gemini Offline."
     
-    # Grok (2026 flagship)
+    # Grok
     try:
         r = grok_client.chat.completions.create(
-            model="grok-4",
+            model="grok-4",  # Change to "grok-beta" or your preferred if needed
             messages=[{"role": "user", "content": prompt}],
             max_tokens=180
         )
         k_out = r.choices[0].message.content.strip()
-    except Exception as e: k_out = f"Grok Error: {e}"
+    except Exception as e:
+        k_out = f"Grok Error: {e}"
     
     return g_out, k_out
 
@@ -56,7 +59,7 @@ st.set_page_config(page_title="Gold Sentinel Pro", page_icon="🥇", layout="wid
 st.title("🥇 Gold Sentinel 8.5 – Fractal Pullback")
 st.caption(f"Phase 2 Protector | {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}")
 
-# ─── MAIN INPUTS (no sidebar) ────────────────────────────────────────────────
+# ─── MAIN INPUTS ─────────────────────────────────────────────────────────────
 st.header("Account Health")
 col1, col2 = st.columns(2)
 with col1:
@@ -81,7 +84,7 @@ if st.button("🚀 Analyze Market Structure", type="primary", use_container_widt
                 # 1. FETCH DATA
                 price_data = td.price(**{"symbol": "XAU/USD"}).as_json()
                 live_price = float(price_data["price"])
-                
+
                 ts_15m = td.time_series(**{
                     "symbol": "XAU/USD",
                     "interval": "15min",
@@ -94,12 +97,20 @@ if st.button("🚀 Analyze Market Structure", type="primary", use_container_widt
                     "outputsize": 50
                 }).with_ema(**{"time_period": 200}).as_pandas()
 
-                # 2. INDICATORS
-                rsi = ts_15m['rsi'].iloc[0]
-                atr = ts_15m['atr'].iloc[0]
-                ema200_15 = ts_15m['ema_1'].iloc[0]
-                ema50_15  = ts_15m['ema_2'].iloc[0]
-                ema200_1h = ts_1h['ema_1'].iloc[0]
+                # 2. SAFE INDICATOR EXTRACTION (EMA workaround)
+                rsi = ts_15m['rsi'].iloc[0] if 'rsi' in ts_15m.columns else 50.0
+                atr = ts_15m['atr'].iloc[0] if 'atr' in ts_15m.columns else 0.0
+
+                # Dynamic EMA detection
+                ema_cols = [c for c in ts_15m.columns if 'ema' in c.lower()]
+                ema_cols.sort()  # usually ema_1 = 200, ema_2 = 50
+                ema200_15 = ts_15m[ema_cols[0]].iloc[0] if len(ema_cols) >= 1 else live_price
+                ema50_15  = ts_15m[ema_cols[1]].iloc[0] if len(ema_cols) >= 2 else live_price
+
+                ema200_1h = ts_1h['ema_1'].iloc[0] if 'ema_1' in ts_1h.columns else live_price
+
+                if len(ema_cols) < 2:
+                    st.warning("Warning: EMA columns not detected as expected. Using fallback values.")
 
                 # 3. TREND ALIGNMENT GUARD
                 if (live_price > ema200_15 and live_price > ema200_1h):
