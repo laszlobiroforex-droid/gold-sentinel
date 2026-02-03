@@ -34,11 +34,15 @@ def get_fractal_levels(df, window=5):
 def get_ai_advice(market, setup, levels, buffer, mode):
     levels_str = ", ".join([f"{l[0]}@{l[1]}" for l in levels[-5:]]) if levels else "No clear levels"
     prompt = f"""
-    High-conviction gold trading auditor for any account size.
+    You are a high-conviction gold trading auditor for any account size.
     Mode: {mode} ({'standard swing (15m + 1h)' if mode == 'Standard' else 'fast scalp (15m + 5m)'}).
-    Aggressive risk is user's choice — do NOT suggest reducing %.
+    Aggressive risk is user's choice — do NOT suggest reducing % risk.
     Focus on math, pullback quality, structural confluence, risk/reward.
     IMPORTANT: For buys, SL must be BELOW entry. For sells, SL must be ABOVE entry.
+
+    Current UTC time: {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}
+    NY session close ~22:00 UTC — factor in thinning liquidity and whipsaw risk after 21:30 UTC.
+    If any high-impact news (FOMC, NFP, CPI, Fed speakers, geopolitical) likely within ±30 min, prefer to wait unless setup is exceptionally strong.
 
     Buffer left: ${buffer:.2f}
     Market: Price ${market['price']:.2f}, RSI {market['rsi']:.1f}
@@ -127,12 +131,12 @@ if not st.session_state.analysis_done:
 else:
     # ─── REMINDER ────────────────────────────────────────────────────────────
     st.info("Analysis locked with your settings:")
-    cols = st.columns(4)
+    cols = st.columns(5)
     cols[0].metric("Balance", f"${st.session_state.balance:.2f}")
     cols[1].metric("Daily Limit", f"${st.session_state.daily_limit:.2f}" if st.session_state.daily_limit else "No limit")
     cols[2].metric("Floor", f"${st.session_state.floor:.2f}")
     cols[3].metric("Risk %", f"{st.session_state.risk_pct}%")
-    cols[3].metric("Mode", st.session_state.mode.split(" – ")[0])
+    cols[4].metric("Mode", st.session_state.mode.split(" – ")[0])
 
     with st.spinner("Scanning structure..."):
         try:
