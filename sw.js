@@ -24,3 +24,5 @@ self.addEventListener('push', e => {
   };
   e.waitUntil(self.registration.showNotification(data.title, options));
 });
+// At end of script
+startPolling();  // force start
