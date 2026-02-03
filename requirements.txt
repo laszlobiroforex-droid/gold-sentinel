@@ -1,5 +1,6 @@
 streamlit
 twelvedata>=1.2.9
 google-generativeai
+openai
 pandas
-pandas_ta
+numpy
