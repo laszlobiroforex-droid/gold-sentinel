@@ -34,18 +34,26 @@ def get_fractal_levels(df, window=5):
 def get_ai_advice(market, setup, levels, buffer, mode):
     levels_str = ", ".join([f"{l[0]}@{l[1]}" for l in levels[-5:]]) if levels else "No clear levels"
     prompt = f"""
-    High-conviction gold trading auditor for any account size.
+    You are a high-conviction gold trading auditor for any account size.
     Mode: {mode} ({'standard swing (15m + 1h)' if mode == 'Standard' else 'fast scalp (15m + 5m)'}).
-    Aggressive risk is user's choice — do NOT suggest reducing %.
+    Aggressive risk is user's choice — do NOT suggest reducing % risk.
     Focus on math, pullback quality, structural confluence, risk/reward.
     IMPORTANT: For buys, SL must be BELOW entry. For sells, SL must be ABOVE entry.
 
     Buffer left: ${buffer:.2f}
     Market: Price ${market['price']:.2f}, RSI {market['rsi']:.1f}
-    Setup: {setup['type']} at ${setup['entry']:.2f} risking ${setup['risk']:.2f}
+    Original setup: {setup['type']} at ${setup['entry']:.2f} risking ${setup['risk']:.2f}
     Fractals: {levels_str}
 
-    Blunt verdict: Elite high-conviction entry or low-edge gamble? 3 sentences max.
+    First, give a blunt verdict on the original setup (elite or low-edge gamble? 2 sentences max).
+
+    Then, if you see a meaningfully better or safer alternative (different entry, SL, TP, RR, lots, or even opposite bias), propose it clearly.
+    Format your proposal like this:
+    PROPOSAL: [brief description, e.g. "Move entry to $X, SL to $Y for 2.5:1 RR"]
+    REASONING: [1-2 sentences why it's better]
+
+    If no meaningful change is needed, just say "No better alternative".
+    Keep total response under 5 sentences.
     """
     try:
         g_out = gemini_model.generate_content(prompt).text.strip()
@@ -56,7 +64,7 @@ def get_ai_advice(market, setup, levels, buffer, mode):
         r = grok_client.chat.completions.create(
             model="grok-4",
             messages=[{"role": "user", "content": prompt}],
-            max_tokens=180
+            max_tokens=220
         )
         k_out = r.choices[0].message.content.strip()
     except Exception as e:
@@ -117,7 +125,7 @@ if not st.session_state.analysis_done:
             st.session_state.analysis_done = True
             st.rerun()
 else:
-    # ─── REMINDER OF INPUTS ──────────────────────────────────────────────────
+    # ─── REMINDER ────────────────────────────────────────────────────────────
     st.info("Analysis locked with your settings:")
     cols = st.columns(4)
     cols[0].metric("Balance", f"${st.session_state.balance:.2f}")
@@ -138,7 +146,7 @@ else:
                 "outputsize": 100
             }).with_rsi(**{}).with_ema(**{"time_period": 200}).with_ema(**{"time_period": 50}).with_atr(**{"time_period": 14}).as_pandas()
 
-            # Select higher or lower timeframe
+            # Higher or lower timeframe
             if st.session_state.mode.startswith("Standard"):
                 ts_htf = td.time_series(**{
                     "symbol": "XAU/USD",
@@ -195,7 +203,6 @@ else:
                 valid_sup = [s for s in supports if s < entry]
                 candidate_sl = valid_sup[0] - (0.3 * atr) if valid_sup else entry - sl_dist
                 
-                # Force correct direction
                 sl = min(candidate_sl, entry - min_sl_distance)
                 
                 if sl >= entry:
@@ -214,7 +221,7 @@ else:
 
                 action_header = "BUY AT MARKET" if entry == live_price else "BUY LIMIT ORDER"
 
-            else:  # BEARISH
+            else:
                 entry = ema50_15m if (ema50_15m - live_price) > (atr * 0.5) else live_price
                 
                 valid_res = [r for r in resistances if r > entry]
@@ -230,92 +237,4 @@ else:
 
                 risk_dist = sl - entry
                 reward_dist = entry - tp
-                actual_rr = reward_dist / risk_dist if risk_dist > 0 else 0
-                
-                if actual_rr < min_rr:
-                    st.warning(f"Reward:risk too low ({actual_rr:.2f}:1) – setup skipped")
-                    st.stop()
-
-                action_header = "SELL AT MARKET" if entry == live_price else "SELL LIMIT ORDER"
-
-            # ─── RISK & SAFETY ───────────────────────────────────────────────────
-            buffer = st.session_state.balance - st.session_state.floor
-            cash_risk = min(buffer * (st.session_state.risk_pct / 100), st.session_state.daily_limit or buffer)
-
-            if cash_risk < 20:
-                st.warning("Calculated risk too small for minimum lot size – skipping")
-                st.stop()
-
-            sl_dist_actual = abs(entry - sl)
-            lots = max(round(cash_risk / ((sl_dist_actual + 0.35) * 100), 2), 0.01)
-            actual_risk = round(lots * (sl_dist_actual + 0.35) * 100, 2)
-
-            # ─── AI OPINIONS FIRST ───────────────────────────────────────────────
-            st.divider()
-            st.subheader("AI Opinions")
-            market = {"price": live_price, "rsi": rsi}
-            setup = {"type": bias, "entry": entry, "risk": actual_risk}
-            g_verdict, k_verdict = get_ai_advice(market, setup, levels, buffer, st.session_state.mode)
-
-            col_g, col_k = st.columns(2)
-            with col_g:
-                st.markdown("**Gemini (Cautious)**")
-                st.info(g_verdict)
-            with col_k:
-                st.markdown("**Grok (Direct)**")
-                st.info(k_verdict)
-
-            st.caption("AI opinions are probabilistic assessments, not trading signals.")
-
-            # ─── ACTION BOX AFTER AI ─────────────────────────────────────────────
-            st.divider()
-            st.markdown(f"### {action_header}")
-            with st.container(border=True):
-                st.metric("Entry", f"${entry:.2f}")
-                col_sl, col_tp = st.columns(2)
-                col_sl.metric("Stop Loss", f"${sl:.2f}")
-                col_tp.metric("Take Profit", f"${tp:.2f}")
-                col_lots, col_risk = st.columns(2)
-                col_lots.metric("Lots", f"{lots:.2f}")
-                col_risk.metric("Risk Amount", f"${actual_risk:.2f}")
-                col_rr = st.columns(1)[0]
-                col_rr.metric("Actual R:R", f"1:{actual_rr:.2f}")
-
-            # Levels
-            with st.expander("Detected Fractal Levels"):
-                st.write("**Resistance above:**", resistances[:3] or "None nearby")
-                st.write("**Support below:**", supports[:3] or "None nearby")
-
-            # Accept button (placeholder for future notification pause)
-            if st.button("✅ Accept This Setup"):
-                st.success("Setup accepted! (Notification pause logic can be added in PWA version)")
-
-            # Save to history
-            st.session_state.saved_setups.append({
-                "time": datetime.utcnow().strftime("%H:%M UTC"),
-                "mode": st.session_state.mode,
-                "bias": bias,
-                "entry": round(entry, 2),
-                "sl": round(sl, 2),
-                "tp": round(tp, 2),
-                "lots": lots,
-                "risk": actual_risk,
-                "rr": actual_rr
-            })
-
-        except Exception as e:
-            st.error(f"Error: {str(e)}")
-
-# ─── HISTORY ─────────────────────────────────────────────────────────────────
-st.divider()
-st.subheader("Recent Setups")
-if st.session_state.saved_setups:
-    df = pd.DataFrame(st.session_state.saved_setups)
-    st.dataframe(df.sort_values("time", ascending=False).head(10), use_container_width=True, hide_index=True)
-else:
-    st.info("No setups saved yet.")
-
-# Reset button
-if st.button("Reset & Enter New Account Settings"):
-    st.session_state.analysis_done = False
-    st.rerun()
+                actual_rr = reward_dist /
