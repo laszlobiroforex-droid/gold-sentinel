@@ -17,7 +17,7 @@ try:
         base_url="https://api.x.ai/v1",
     )
 except Exception as e:
-    st.error(f"API setup failed: {e}\nCheck secrets: TWELVE_DATA_KEY, GEMINI_KEY, GROK_API_KEY")
+    st.error(f"API setup failed: {e}")
     st.stop()
 
 # ─── FRACTAL LEVELS ──────────────────────────────────────────────────────────
@@ -31,10 +31,11 @@ def get_fractal_levels(df, window=5):
     return levels
 
 # ─── DUAL AUDITORS ───────────────────────────────────────────────────────────
-def get_ai_advice(market, setup, levels, buffer):
+def get_ai_advice(market, setup, levels, buffer, mode):
     levels_str = ", ".join([f"{l[0]}@{l[1]}" for l in levels[-5:]]) if levels else "No clear levels"
     prompt = f"""
     High-conviction gold trading auditor for any account size.
+    Mode: {mode} ({'standard swing' if mode == 'Standard' else 'fast scalp'}).
     Aggressive risk is user's choice — do NOT suggest reducing %.
     Focus on math, pullback quality, structural confluence, risk/reward.
 
@@ -59,91 +60,8 @@ def get_ai_advice(market, setup, levels, buffer):
     
     return g_out, k_out
 
-# ─── PWA + PUSH SUPPORT ──────────────────────────────────────────────────────
-st.markdown("""
-<link rel="manifest" href="/manifest.json">
-<meta name="theme-color" content="#000000">
-<link rel="icon" href="https://img.icons8.com/fluency/192/000000/gold-bar.png">
-""", unsafe_allow_html=True)
-
-st.markdown(f"""
-<script>
-  const vapidPublicKey = "{st.secrets.get('VAPID_PUBLIC_KEY', '')}";
-
-  // Register service worker
-  if ('serviceWorker' in navigator) {{
-    window.addEventListener('load', () => {{
-      navigator.serviceWorker.register('/sw.js')
-        .then(reg => console.log('Service Worker registered'))
-        .catch(err => console.log('SW failed:', err));
-    }});
-  }}
-
-  // Request push permission & subscribe
-  async function subscribeToPush() {{
-    if (!vapidPublicKey) {{
-      console.log('VAPID key missing');
-      return;
-    }}
-    if (!('PushManager' in window)) {{
-      console.log('Push not supported');
-      return;
-    }}
-    const permission = await Notification.requestPermission();
-    if (permission !== 'granted') {{
-      console.log('Notifications denied');
-      return;
-    }}
-
-    const reg = await navigator.serviceWorker.ready;
-    const sub = await reg.pushManager.subscribe({{
-      userVisibleOnly: true,
-      applicationServerKey: vapidPublicKey
-    }});
-
-    console.log('Push subscribed');
-  }}
-
-  if (Notification.permission === 'default') {{
-    subscribeToPush();
-  }}
-
-  // Accept setup → pause notifications
-  window.acceptSetup = function() {{
-    localStorage.setItem('setup_accepted', Date.now());
-    clearInterval(window.checkInterval);
-    alert('Setup accepted — notifications paused for 24 hours');
-  }};
-
-  // 15-min auto-check
-  window.checkInterval = setInterval(async () => {{
-    if (localStorage.getItem('setup_accepted')) {{
-      const accepted = parseInt(localStorage.getItem('setup_accepted'));
-      if (Date.now() - accepted < 24 * 60 * 60 * 1000) return;
-      localStorage.removeItem('setup_accepted');
-    }}
-
-    try {{
-      const res = await fetch('/check_latest_setup');
-      const data = await res.json();
-
-      if (data.setup && !data.accepted) {{
-        const reg = await navigator.serviceWorker.ready;
-        reg.showNotification('High Conviction Setup Available', {{
-          body: `\( {{data.setup.bias}} | Entry ~ \){{data.setup.entry}} | Risk $${{data.setup.risk}}`,
-          icon: 'https://img.icons8.com/fluency/192/000000/gold-bar.png',
-          tag: 'sentinel-setup-' + data.setup.timestamp,
-          renotify: true
-        }});
-      }}
-    }} catch (err) {{
-      console.log('Check failed:', err);
-    }}
-  }}, 15 * 60 * 1000);
-</script>
-""", unsafe_allow_html=True)
-
 # ─── APP ─────────────────────────────────────────────────────────────────────
+st.set_page_config(page_title="Gold Sentinel Pro", page_icon="🥇", layout="wide")
 st.title("🥇 Gold Sentinel – High Conviction Gold Entries")
 st.caption(f"Adaptive pullback engine | {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}")
 
@@ -154,6 +72,7 @@ if "analysis_done" not in st.session_state:
     st.session_state.daily_limit = None
     st.session_state.floor = 0.0
     st.session_state.risk_pct = 25
+    st.session_state.mode = "Standard"
 
 if "saved_setups" not in st.session_state:
     st.session_state.saved_setups = []
@@ -181,6 +100,12 @@ if not st.session_state.analysis_done:
         "Risk % of Available Buffer", 5, 50, st.session_state.risk_pct, step=5
     )
 
+    st.session_state.mode = st.radio(
+        "Analysis Mode",
+        ["Standard (Swing – 15m + 1h alignment)", "Scalp (Fast – 15m + 5m alignment)"],
+        index=0 if st.session_state.mode == "Standard" else 1
+    )
+
     if st.button("🚀 Analyze & Suggest", type="primary", use_container_width=True):
         if st.session_state.balance is None:
             st.error("❌ Enter current balance")
@@ -195,44 +120,59 @@ else:
     cols[1].metric("Daily Limit", f"${st.session_state.daily_limit:.2f}" if st.session_state.daily_limit else "No limit")
     cols[2].metric("Floor", f"${st.session_state.floor:.2f}")
     cols[3].metric("Risk %", f"{st.session_state.risk_pct}%")
+    cols[3].metric("Mode", st.session_state.mode.split(" – ")[0])
 
     with st.spinner("Scanning structure..."):
         try:
             price_data = td.price(**{"symbol": "XAU/USD"}).as_json()
             live_price = float(price_data["price"])
 
+            # 15 min data (always needed)
             ts_15m = td.time_series(**{
                 "symbol": "XAU/USD",
                 "interval": "15min",
                 "outputsize": 100
             }).with_rsi(**{}).with_ema(**{"time_period": 200}).with_ema(**{"time_period": 50}).with_atr(**{"time_period": 14}).as_pandas()
 
-            ts_1h = td.time_series(**{
-                "symbol": "XAU/USD",
-                "interval": "1h",
-                "outputsize": 50
-            }).with_ema(**{"time_period": 200}).as_pandas()
+            # Select higher or lower timeframe depending on mode
+            if st.session_state.mode.startswith("Standard"):
+                ts_htf = td.time_series(**{
+                    "symbol": "XAU/USD",
+                    "interval": "1h",
+                    "outputsize": 50
+                }).with_ema(**{"time_period": 200}).as_pandas()
+                htf_label = "1H"
+            else:
+                ts_htf = td.time_series(**{
+                    "symbol": "XAU/USD",
+                    "interval": "5min",
+                    "outputsize": 100
+                }).with_ema(**{"time_period": 200}).as_pandas()
+                htf_label = "5M"
 
             # SAFE EMA DETECTION
             rsi = ts_15m['rsi'].iloc[0] if 'rsi' in ts_15m.columns else 50.0
             atr = ts_15m['atr'].iloc[0] if 'atr' in ts_15m.columns else 0.0
 
-            ema_cols = [c for c in ts_15m.columns if 'ema' in c.lower()]
-            ema_cols.sort()
-            ema200_15 = ts_15m[ema_cols[0]].iloc[0] if len(ema_cols) >= 1 else live_price
-            ema50_15  = ts_15m[ema_cols[1]].iloc[0] if len(ema_cols) >= 2 else live_price
-            ema200_1h = ts_1h['ema_1'].iloc[0] if 'ema_1' in ts_1h.columns else live_price
+            ema_cols_15m = [c for c in ts_15m.columns if 'ema' in c.lower()]
+            ema_cols_15m.sort()
+            ema200_15m = ts_15m[ema_cols_15m[0]].iloc[0] if len(ema_cols_15m) >= 1 else live_price
+            ema50_15m  = ts_15m[ema_cols_15m[1]].iloc[0] if len(ema_cols_15m) >= 2 else live_price
 
-            # TREND ALIGNMENT
-            if (live_price > ema200_15 and live_price > ema200_1h):
-                bias = "BULLISH"
-            elif (live_price < ema200_15 and live_price < ema200_1h):
-                bias = "BEARISH"
-            else:
-                st.warning(f"Trend misalignment – 1H EMA200 at ${ema200_1h:.2f}")
-                st.markdown("**Short explanation:** The 15-minute and 1-hour trends are not aligned. This prevents trades against the larger trend, which often leads to quick stops.")
+            ema_cols_htf = [c for c in ts_htf.columns if 'ema' in c.lower()]
+            ema200_htf = ts_htf[ema_cols_htf[0]].iloc[0] if ema_cols_htf else live_price
+
+            # TREND ALIGNMENT (mode-dependent)
+            aligned = (live_price > ema200_15m and live_price > ema200_htf) or \
+                      (live_price < ema200_15m and live_price < ema200_htf)
+
+            if not aligned:
+                st.warning(f"Trend misalignment – {htf_label} EMA200 at ${ema200_htf:.2f}")
+                st.markdown("**Short explanation:** The 15-minute and higher-timeframe trends are not aligned. This prevents trades against the larger trend, which often leads to quick stops.")
                 st.markdown("**Suggested action:** Wait approximately **15 minutes** (one full 15-min candle) and press 'Analyze & Suggest' again to check if structure has normalized.")
                 st.stop()
+
+            bias = "BULLISH" if live_price > ema200_15m else "BEARISH"
 
             # FRACTAL LEVELS
             levels = get_fractal_levels(ts_15m)
@@ -242,12 +182,12 @@ else:
             # PULLBACK ENTRY
             sl_dist = round(atr * 1.5, 2)
             if bias == "BULLISH":
-                entry = ema50_15 if (live_price - ema50_15) > (atr * 0.5) else live_price
+                entry = ema50_15m if (live_price - ema50_15m) > (atr * 0.5) else live_price
                 sl = supports[0] - (0.3 * atr) if supports else entry - sl_dist
                 tp = resistances[0] if resistances else entry + (sl_dist * 2.5)
                 action_header = "BUY AT MARKET" if entry == live_price else "BUY LIMIT ORDER"
             else:
-                entry = ema50_15 if (ema50_15 - live_price) > (atr * 0.5) else live_price
+                entry = ema50_15m if (ema50_15m - live_price) > (atr * 0.5) else live_price
                 sl = resistances[0] + (0.3 * atr) if resistances else entry + sl_dist
                 tp = supports[0] if supports else entry - (sl_dist * 2.5)
                 action_header = "SELL AT MARKET" if entry == live_price else "SELL LIMIT ORDER"
@@ -269,7 +209,7 @@ else:
             st.subheader("AI Opinions")
             market = {"price": live_price, "rsi": rsi}
             setup = {"type": bias, "entry": entry, "risk": actual_risk}
-            g_verdict, k_verdict = get_ai_advice(market, setup, levels, buffer)
+            g_verdict, k_verdict = get_ai_advice(market, setup, levels, buffer, st.session_state.mode)
 
             col_g, col_k = st.columns(2)
             with col_g:
@@ -300,12 +240,12 @@ else:
 
             # Accept button
             if st.button("✅ Accept This Setup & Pause Notifications"):
-                st.markdown("<script>window.acceptSetup();</script>", unsafe_allow_html=True)
-                st.success("Accepted! Notifications paused for 24 hours (or until reset).")
+                st.success("Accepted! (Notification pause logic can be added later in PWA version)")
 
             # Save
             st.session_state.saved_setups.append({
                 "time": datetime.utcnow().strftime("%H:%M UTC"),
+                "mode": st.session_state.mode,
                 "bias": bias,
                 "entry": round(entry, 2),
                 "risk": actual_risk
@@ -327,9 +267,3 @@ else:
 if st.button("Reset & Enter New Account Settings"):
     st.session_state.analysis_done = False
     st.rerun()
-
-    st.markdown("""
-<button onclick="console.log('Polling active: ' + (window.checkInterval ? 'Yes' : 'No'))">
-  Debug: Check polling status
-</button>
-""", unsafe_allow_html=True)
