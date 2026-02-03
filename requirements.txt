@@ -4,3 +4,4 @@ google-generativeai
 openai
 pandas
 numpy
+pywebpush
