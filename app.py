@@ -17,7 +17,7 @@ try:
         base_url="https://api.x.ai/v1",
     )
 except Exception as e:
-    st.error(f"API setup failed: {e}")
+    st.error(f"API setup failed: {e}\nCheck secrets: TWELVE_DATA_KEY, GEMINI_KEY, GROK_API_KEY")
     st.stop()
 
 # ─── FRACTAL LEVELS ──────────────────────────────────────────────────────────
@@ -35,9 +35,10 @@ def get_ai_advice(market, setup, levels, buffer, mode):
     levels_str = ", ".join([f"{l[0]}@{l[1]}" for l in levels[-5:]]) if levels else "No clear levels"
     prompt = f"""
     High-conviction gold trading auditor for any account size.
-    Mode: {mode} ({'standard swing' if mode == 'Standard' else 'fast scalp'}).
+    Mode: {mode} ({'standard swing (15m + 1h)' if mode == 'Standard' else 'fast scalp (15m + 5m)'}).
     Aggressive risk is user's choice — do NOT suggest reducing %.
     Focus on math, pullback quality, structural confluence, risk/reward.
+    IMPORTANT: For buys, SL must be BELOW entry. For sells, SL must be ABOVE entry.
 
     Buffer left: ${buffer:.2f}
     Market: Price ${market['price']:.2f}, RSI {market['rsi']:.1f}
@@ -46,8 +47,10 @@ def get_ai_advice(market, setup, levels, buffer, mode):
 
     Blunt verdict: Elite high-conviction entry or low-edge gamble? 3 sentences max.
     """
-    try: g_out = gemini_model.generate_content(prompt).text.strip()
-    except: g_out = "Gemini Offline."
+    try:
+        g_out = gemini_model.generate_content(prompt).text.strip()
+    except:
+        g_out = "Gemini Offline."
 
     try:
         r = grok_client.chat.completions.create(
@@ -56,7 +59,8 @@ def get_ai_advice(market, setup, levels, buffer, mode):
             max_tokens=180
         )
         k_out = r.choices[0].message.content.strip()
-    except Exception as e: k_out = f"Grok Error: {e}"
+    except Exception as e:
+        k_out = f"Grok Error: {e}"
     
     return g_out, k_out
 
@@ -65,7 +69,7 @@ st.set_page_config(page_title="Gold Sentinel Pro", page_icon="🥇", layout="wid
 st.title("🥇 Gold Sentinel – High Conviction Gold Entries")
 st.caption(f"Adaptive pullback engine | {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}")
 
-# Initialize session state
+# ─── SESSION STATE INIT ──────────────────────────────────────────────────────
 if "analysis_done" not in st.session_state:
     st.session_state.analysis_done = False
     st.session_state.balance = None
@@ -113,8 +117,8 @@ if not st.session_state.analysis_done:
             st.session_state.analysis_done = True
             st.rerun()
 else:
-    # Reminder
-    st.info("Analysis locked:")
+    # ─── REMINDER OF INPUTS ──────────────────────────────────────────────────
+    st.info("Analysis locked with your settings:")
     cols = st.columns(4)
     cols[0].metric("Balance", f"${st.session_state.balance:.2f}")
     cols[1].metric("Daily Limit", f"${st.session_state.daily_limit:.2f}" if st.session_state.daily_limit else "No limit")
@@ -127,14 +131,14 @@ else:
             price_data = td.price(**{"symbol": "XAU/USD"}).as_json()
             live_price = float(price_data["price"])
 
-            # 15 min data (always needed)
+            # ─── DATA FETCH ──────────────────────────────────────────────────────
             ts_15m = td.time_series(**{
                 "symbol": "XAU/USD",
                 "interval": "15min",
                 "outputsize": 100
             }).with_rsi(**{}).with_ema(**{"time_period": 200}).with_ema(**{"time_period": 50}).with_atr(**{"time_period": 14}).as_pandas()
 
-            # Select higher or lower timeframe depending on mode
+            # Select higher or lower timeframe
             if st.session_state.mode.startswith("Standard"):
                 ts_htf = td.time_series(**{
                     "symbol": "XAU/USD",
@@ -150,7 +154,7 @@ else:
                 }).with_ema(**{"time_period": 200}).as_pandas()
                 htf_label = "5M"
 
-            # SAFE EMA DETECTION
+            # ─── SAFE INDICATOR EXTRACTION ───────────────────────────────────────
             rsi = ts_15m['rsi'].iloc[0] if 'rsi' in ts_15m.columns else 50.0
             atr = ts_15m['atr'].iloc[0] if 'atr' in ts_15m.columns else 0.0
 
@@ -162,37 +166,79 @@ else:
             ema_cols_htf = [c for c in ts_htf.columns if 'ema' in c.lower()]
             ema200_htf = ts_htf[ema_cols_htf[0]].iloc[0] if ema_cols_htf else live_price
 
-            # TREND ALIGNMENT (mode-dependent)
+            # ─── TREND ALIGNMENT ─────────────────────────────────────────────────
             aligned = (live_price > ema200_15m and live_price > ema200_htf) or \
                       (live_price < ema200_15m and live_price < ema200_htf)
 
             if not aligned:
                 st.warning(f"Trend misalignment – {htf_label} EMA200 at ${ema200_htf:.2f}")
-                st.markdown("**Short explanation:** The 15-minute and higher-timeframe trends are not aligned. This prevents trades against the larger trend, which often leads to quick stops.")
-                st.markdown("**Suggested action:** Wait approximately **15 minutes** (one full 15-min candle) and press 'Analyze & Suggest' again to check if structure has normalized.")
+                st.markdown("**Short explanation:** The 15-minute and higher-timeframe trends are not aligned. This prevents trades against the larger trend.")
+                st.markdown("**Suggested action:** Wait approximately **15 minutes** and press 'Analyze & Suggest' again.")
                 st.stop()
 
             bias = "BULLISH" if live_price > ema200_15m else "BEARISH"
 
-            # FRACTAL LEVELS
+            # ─── FRACTAL LEVELS ──────────────────────────────────────────────────
             levels = get_fractal_levels(ts_15m)
             resistances = sorted([l[1] for l in levels if l[0] == 'RES' and l[1] > live_price])
             supports = sorted([l[1] for l in levels if l[0] == 'SUP' and l[1] < live_price], reverse=True)
 
-            # PULLBACK ENTRY
+            # ─── PULLBACK ENTRY + FORCED CORRECT SL DIRECTION ────────────────────
             sl_dist = round(atr * 1.5, 2)
+            min_sl_distance = atr * 0.4
+            min_rr = 1.2
+
             if bias == "BULLISH":
                 entry = ema50_15m if (live_price - ema50_15m) > (atr * 0.5) else live_price
-                sl = supports[0] - (0.3 * atr) if supports else entry - sl_dist
+                
+                # Valid support BELOW entry
+                valid_sup = [s for s in supports if s < entry]
+                candidate_sl = valid_sup[0] - (0.3 * atr) if valid_sup else entry - sl_dist
+                
+                # Force correct direction
+                sl = min(candidate_sl, entry - min_sl_distance)
+                
+                if sl >= entry:
+                    st.warning("No valid stop-loss below entry – setup skipped")
+                    st.stop()
+
                 tp = resistances[0] if resistances else entry + (sl_dist * 2.5)
+
+                risk_dist = entry - sl
+                reward_dist = tp - entry
+                actual_rr = reward_dist / risk_dist if risk_dist > 0 else 0
+                
+                if actual_rr < min_rr:
+                    st.warning(f"Reward:risk too low ({actual_rr:.2f}:1) – setup skipped")
+                    st.stop()
+
                 action_header = "BUY AT MARKET" if entry == live_price else "BUY LIMIT ORDER"
-            else:
+
+            else:  # BEARISH
                 entry = ema50_15m if (ema50_15m - live_price) > (atr * 0.5) else live_price
-                sl = resistances[0] + (0.3 * atr) if resistances else entry + sl_dist
+                
+                valid_res = [r for r in resistances if r > entry]
+                candidate_sl = valid_res[0] + (0.3 * atr) if valid_res else entry + sl_dist
+                
+                sl = max(candidate_sl, entry + min_sl_distance)
+                
+                if sl <= entry:
+                    st.warning("No valid stop-loss above entry – setup skipped")
+                    st.stop()
+
                 tp = supports[0] if supports else entry - (sl_dist * 2.5)
+
+                risk_dist = sl - entry
+                reward_dist = entry - tp
+                actual_rr = reward_dist / risk_dist if risk_dist > 0 else 0
+                
+                if actual_rr < min_rr:
+                    st.warning(f"Reward:risk too low ({actual_rr:.2f}:1) – setup skipped")
+                    st.stop()
+
                 action_header = "SELL AT MARKET" if entry == live_price else "SELL LIMIT ORDER"
 
-            # RISK & SAFETY
+            # ─── RISK & SAFETY ───────────────────────────────────────────────────
             buffer = st.session_state.balance - st.session_state.floor
             cash_risk = min(buffer * (st.session_state.risk_pct / 100), st.session_state.daily_limit or buffer)
 
@@ -232,23 +278,29 @@ else:
                 col_lots, col_risk = st.columns(2)
                 col_lots.metric("Lots", f"{lots:.2f}")
                 col_risk.metric("Risk Amount", f"${actual_risk:.2f}")
+                col_rr = st.columns(1)[0]
+                col_rr.metric("Actual R:R", f"1:{actual_rr:.2f}")
 
             # Levels
             with st.expander("Detected Fractal Levels"):
                 st.write("**Resistance above:**", resistances[:3] or "None nearby")
                 st.write("**Support below:**", supports[:3] or "None nearby")
 
-            # Accept button
-            if st.button("✅ Accept This Setup & Pause Notifications"):
-                st.success("Accepted! (Notification pause logic can be added later in PWA version)")
+            # Accept button (placeholder for future notification pause)
+            if st.button("✅ Accept This Setup"):
+                st.success("Setup accepted! (Notification pause logic can be added in PWA version)")
 
-            # Save
+            # Save to history
             st.session_state.saved_setups.append({
                 "time": datetime.utcnow().strftime("%H:%M UTC"),
                 "mode": st.session_state.mode,
                 "bias": bias,
                 "entry": round(entry, 2),
-                "risk": actual_risk
+                "sl": round(sl, 2),
+                "tp": round(tp, 2),
+                "lots": lots,
+                "risk": actual_risk,
+                "rr": actual_rr
             })
 
         except Exception as e:
