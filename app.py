@@ -327,3 +327,9 @@ else:
 if st.button("Reset & Enter New Account Settings"):
     st.session_state.analysis_done = False
     st.rerun()
+
+    st.markdown("""
+<button onclick="console.log('Polling active: ' + (window.checkInterval ? 'Yes' : 'No'))">
+  Debug: Check polling status
+</button>
+""", unsafe_allow_html=True)
