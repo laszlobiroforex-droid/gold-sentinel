@@ -7,8 +7,17 @@ from openai import OpenAI
 from datetime import datetime
 
 st.markdown("""
-<script src="//cdn.jsdelivr.net/npm/eruda"></script>
-<script>eruda.init();</script>
+<script src="https://unpkg.com/eruda"></script>
+<script>
+  eruda.init({
+    defaults: {
+      container: document.body,
+      tool: ['console', 'elements', 'network'],
+      theme: 'Monokai Pro'
+    }
+  });
+  eruda.show();  // force show immediately
+</script>
 """, unsafe_allow_html=True)
 
 # ─── API INIT ────────────────────────────────────────────────────────────────
