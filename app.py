@@ -1,10 +1,21 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
+import os
 from twelvedata import TDClient
 import google.generativeai as genai
 from openai import OpenAI
 from datetime import datetime
+
+# ─── CONFIG ──────────────────────────────────────────────────────────────────
+JOURNAL_FILE = "trade_journal.csv"
+JOURNAL_COLUMNS = [
+    "id", "timestamp", "bias", "entry", "stop", "target", "lots", "risk",
+    "status", "open_time", "close_time", "close_price", "result"
+]
+
+CONTRACT_VALUE = 100   # $100 per $1 move per 1.0 lot (XAUUSD standard micro)
+SPREAD_BUFFER = 0.35   # typical spread/slippage
 
 # ─── API INIT ────────────────────────────────────────────────────────────────
 try:
@@ -20,6 +31,70 @@ except Exception as e:
     st.error(f"API setup failed: {e}")
     st.stop()
 
+# ─── JOURNAL UTILS ───────────────────────────────────────────────────────────
+def load_journal():
+    if os.path.exists(JOURNAL_FILE):
+        return pd.read_csv(JOURNAL_FILE)
+    df = pd.DataFrame(columns=JOURNAL_COLUMNS)
+    df.to_csv(JOURNAL_FILE, index=False)
+    return df
+
+def save_journal(df):
+    df.to_csv(JOURNAL_FILE, index=False)
+
+def update_journal(journal_df, ts):
+    ts = ts.reset_index().rename(columns={"index": "datetime"})  # ensure datetime column
+    for i, row in journal_df.iterrows():
+        if row["status"] in ["CLOSED", "CANCELLED"]:
+            continue
+
+        entry = row["entry"]
+        sl = row["stop"]
+        tp = row["target"]
+        bias = row["bias"]
+
+        for _, candle in ts.iterrows():
+            high = candle["high"]
+            low = candle["low"]
+            time = candle["datetime"]
+
+            if row["status"] == "PENDING":
+                if bias == "BULLISH" and low <= entry <= high:
+                    journal_df.at[i, "status"] = "OPEN"
+                    journal_df.at[i, "open_time"] = time
+                elif bias == "BEARISH" and high >= entry >= low:
+                    journal_df.at[i, "status"] = "OPEN"
+                    journal_df.at[i, "open_time"] = time
+
+            elif row["status"] == "OPEN":
+                if bias == "BULLISH":
+                    if low <= sl:
+                        journal_df.at[i, "status"] = "CLOSED"
+                        journal_df.at[i, "close_price"] = sl
+                        journal_df.at[i, "close_time"] = time
+                        journal_df.at[i, "result"] = "LOSS"
+                        break
+                    if high >= tp:
+                        journal_df.at[i, "status"] = "CLOSED"
+                        journal_df.at[i, "close_price"] = tp
+                        journal_df.at[i, "close_time"] = time
+                        journal_df.at[i, "result"] = "WIN"
+                        break
+                else:
+                    if high >= sl:
+                        journal_df.at[i, "status"] = "CLOSED"
+                        journal_df.at[i, "close_price"] = sl
+                        journal_df.at[i, "close_time"] = time
+                        journal_df.at[i, "result"] = "LOSS"
+                        break
+                    if low <= tp:
+                        journal_df.at[i, "status"] = "CLOSED"
+                        journal_df.at[i, "close_price"] = tp
+                        journal_df.at[i, "close_time"] = time
+                        journal_df.at[i, "result"] = "WIN"
+                        break
+    return journal_df
+
 # ─── FRACTAL LEVELS ──────────────────────────────────────────────────────────
 def get_fractal_levels(df, window=5):
     levels = []
@@ -31,20 +106,21 @@ def get_fractal_levels(df, window=5):
     return levels
 
 # ─── DUAL AUDITORS ───────────────────────────────────────────────────────────
-def get_ai_advice(market, setup, levels):
+def get_ai_advice(market, setup, levels, buffer):
     levels_str = ", ".join([f"{l[0]}@{l[1]}" for l in levels[-5:]]) if levels else "No clear levels"
     prompt = f"""
-    Trading auditor for any gold account (challenge or live cash).
-    Aggressive risk is user's choice – do NOT suggest lowering %.
+    High-conviction gold trading auditor for any account size.
+    Aggressive risk is user's choice — do NOT suggest reducing %.
     Focus on math, pullback quality, structural confluence, risk/reward.
 
-    Account buffer left: ${account['buffer']:.2f}
+    Buffer left: ${buffer:.2f}
     Market: Price ${market['price']:.2f}, RSI {market['rsi']:.1f}
     Setup: {setup['type']} at ${setup['entry']:.2f} risking ${setup['risk']:.2f}
+    Fractals: {levels_str}
 
-    Blunt: Elite high-conviction entry or low-edge gamble? 3 sentences max.
+    Blunt verdict: Elite high-conviction entry or low-edge gamble? 3 sentences max.
     """
-    try: g_out = gemini_model.generate_content(prompt).text.strip()
+    try: g_out = genai.GenerativeModel('gemini-2.5-flash').generate_content(prompt).text.strip()
     except: g_out = "Gemini Offline."
 
     try:
@@ -63,156 +139,212 @@ st.set_page_config(page_title="Gold Sentinel Pro", page_icon="🥇", layout="wid
 st.title("🥇 Gold Sentinel – High Conviction Gold Entries")
 st.caption(f"Adaptive pullback engine | {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}")
 
-# ─── INPUTS (front and center) ───────────────────────────────────────────────
-st.header("Account Settings")
-col1, col2 = st.columns(2)
-with col1:
-    balance = st.number_input("Current Balance ($)", min_value=0.0, value=None, placeholder="Required", format="%.2f")
-with col2:
-    daily_limit = st.number_input("Daily Drawdown Limit ($)", min_value=0.0, value=None, placeholder="Optional / set to balance for no limit", format="%.2f")
+# Initialize session state
+if "analysis_done" not in st.session_state:
+    st.session_state.analysis_done = False
+    st.session_state.balance = None
+    st.session_state.daily_limit = None
+    st.session_state.floor = 0.0
+    st.session_state.risk_pct = 25
 
-survival_floor = st.number_input("Survival Floor / Max DD Line ($)", value=0.0, format="%.2f")
-
-risk_pct = st.slider("Risk % of Available Buffer", 5, 50, 25, step=5)
-
-if 'saved_setups' not in st.session_state:
+if "saved_setups" not in st.session_state:
     st.session_state.saved_setups = []
 
-# ─── MAIN LOGIC ──────────────────────────────────────────────────────────────
-if st.button("🚀 Analyze & Suggest", type="primary", use_container_width=True):
-    if balance is None:
-        st.error("❌ Please enter current balance")
-    else:
-        with st.spinner("Scanning structure..."):
-            try:
-                price_data = td.price(**{"symbol": "XAU/USD"}).as_json()
-                live_price = float(price_data["price"])
+journal_df = load_journal()
 
-                ts_15m = td.time_series(**{
-                    "symbol": "XAU/USD",
-                    "interval": "15min",
-                    "outputsize": 100
-                }).with_rsi(**{}).with_ema(**{"time_period": 200}).with_ema(**{"time_period": 50}).with_atr(**{"time_period": 14}).as_pandas()
+# ─── INPUTS ──────────────────────────────────────────────────────────────────
+if not st.session_state.analysis_done:
+    st.header("Account Settings")
+    col1, col2 = st.columns(2)
+    with col1:
+        st.session_state.balance = st.number_input(
+            "Current Balance ($)", min_value=0.0, value=st.session_state.balance,
+            placeholder="Required", format="%.2f", key="balance_input"
+        )
+    with col2:
+        st.session_state.daily_limit = st.number_input(
+            "Daily Drawdown Limit ($)", min_value=0.0, value=st.session_state.daily_limit,
+            placeholder="Optional (set to balance for no limit)", format="%.2f", key="limit_input"
+        )
 
-                ts_1h = td.time_series(**{
-                    "symbol": "XAU/USD",
-                    "interval": "1h",
-                    "outputsize": 50
-                }).with_ema(**{"time_period": 200}).as_pandas()
+    st.session_state.floor = st.number_input(
+        "Survival Floor / Max DD ($)", value=st.session_state.floor, format="%.2f"
+    )
 
-                # SAFE EMA DETECTION
-                rsi = ts_15m['rsi'].iloc[0] if 'rsi' in ts_15m.columns else 50.0
-                atr = ts_15m['atr'].iloc[0] if 'atr' in ts_15m.columns else 0.0
+    st.session_state.risk_pct = st.slider(
+        "Risk % of Available Buffer", 5, 50, st.session_state.risk_pct, step=5
+    )
 
-                ema_cols = [c for c in ts_15m.columns if 'ema' in c.lower()]
-                ema_cols.sort()
-                ema200_15 = ts_15m[ema_cols[0]].iloc[0] if len(ema_cols) >= 1 else live_price
-                ema50_15  = ts_15m[ema_cols[1]].iloc[0] if len(ema_cols) >= 2 else live_price
-                ema200_1h = ts_1h['ema_1'].iloc[0] if 'ema_1' in ts_1h.columns else live_price
-
-                # TREND ALIGNMENT
-                if (live_price > ema200_15 and live_price > ema200_1h):
-                    bias = "BULLISH"
-                elif (live_price < ema200_15 and live_price < ema200_1h):
-                    bias = "BEARISH"
-                else:
-                    st.warning(f"Trend misalignment – 1H EMA200 at ${ema200_1h:.2f}")
-                    st.markdown("**Short explanation:** The 15-minute trend direction is not supported by the 1-hour timeframe. This filter prevents fighting the bigger trend and getting stopped out quickly.")
-                    st.markdown("**Suggested action:** Wait approximately **15 minutes** (one full 15-min candle) and press 'Analyze & Suggest' again to see if the structure has normalized.")
-                    st.stop()
-
-                # FRACTAL LEVELS
-                levels = get_fractal_levels(ts_15m)
-                resistances = sorted([l[1] for l in levels if l[0] == 'RES' and l[1] > live_price])
-                supports = sorted([l[1] for l in levels if l[0] == 'SUP' and l[1] < live_price], reverse=True)
-
-                # PULLBACK ENTRY
-                sl_dist = round(atr * 1.5, 2)
-                if bias == "BULLISH":
-                    entry = ema50_15 if (live_price - ema50_15) > (atr * 0.5) else live_price
-                    sl = supports[0] - 1.0 if supports else entry - sl_dist
-                    tp = resistances[0] if resistances else entry + (sl_dist * 2.5)
-                    action_header = "BUY AT MARKET" if entry == live_price else "BUY LIMIT ORDER"
-                else:
-                    entry = ema50_15 if (ema50_15 - live_price) > (atr * 0.5) else live_price
-                    sl = resistances[0] + 1.0 if resistances else entry + sl_dist
-                    tp = supports[0] if supports else entry - (sl_dist * 2.5)
-                    action_header = "SELL AT MARKET" if entry == live_price else "SELL LIMIT ORDER"
-
-                # RISK & SAFETY
-                buffer = balance - survival_floor
-                cash_risk = min(buffer * (risk_pct / 100), daily_limit or buffer)
-
-                if cash_risk < 20:
-                    st.warning("Calculated risk too small for minimum lot size – skipping")
-                    st.stop()
-
-                sl_dist_actual = abs(entry - sl)
-                lots = max(round(cash_risk / ((sl_dist_actual + 0.35) * 100), 2), 0.01)
-                actual_risk = round(lots * (sl_dist_actual + 0.35) * 100, 2)
-
-                # ─── ACTION BOX ──────────────────────────────────────────────────
-                st.markdown(f"### {action_header}")
-                with st.container(border=True):
-                    st.metric("Entry", f"${entry:.2f}")
-                    col_sl, col_tp = st.columns(2)
-                    col_sl.metric("Stop Loss", f"${sl:.2f}")
-                    col_tp.metric("Take Profit", f"${tp:.2f}")
-                    st.metric("Lots", f"{lots:.2f}")
-                    st.metric("Risk Amount", f"${actual_risk:.2f}")
-
-                # Dual AI opinions
-                st.divider()
-                st.subheader("AI Opinions")
-                market = {"price": live_price, "rsi": rsi}
-                setup = {"type": bias, "entry": entry, "risk": actual_risk}
-                g_verdict, k_verdict = get_ai_advice(market, setup, levels)
-
-                col_g, col_k = st.columns(2)
-                with col_g:
-                    st.markdown("**Gemini (Cautious)**")
-                    st.info(g_verdict)
-                with col_k:
-                    st.markdown("**Grok (Direct)**")
-                    st.info(k_verdict)
-
-                # Consensus
-                g_low, k_low = g_verdict.lower(), k_verdict.lower()
-                if "elite" in g_low and "elite" in k_low:
-                    st.success("✅ Both AIs agree: High-conviction setup")
-                elif "gamble" in g_low or "reckless" in g_low or "gamble" in k_low or "reckless" in k_low:
-                    st.warning("⚠️ Caution: At least one AI flags risk")
-                else:
-                    st.info("Mixed or neutral – review both opinions")
-
-                # Levels
-                with st.expander("Detected Fractal Levels"):
-                    st.write("**Resistance above:**", resistances[:3] or "None nearby")
-                    st.write("**Support below:**", supports[:3] or "None nearby")
-
-                # Save
-                st.session_state.saved_setups.append({
-                    "time": datetime.utcnow().strftime("%H:%M UTC"),
-                    "bias": bias,
-                    "entry": round(entry, 2),
-                    "risk": actual_risk
-                })
-
-            except Exception as e:
-                st.error(f"Error: {str(e)}")
-
-# ─── HISTORY ─────────────────────────────────────────────────────────────────
-st.divider()
-st.subheader("Recent Setups")
-if st.session_state.saved_setups:
-    df = pd.DataFrame(st.session_state.saved_setups)
-    st.dataframe(df.sort_values("time", ascending=False).head(10), use_container_width=True, hide_index=True)
+    if st.button("🚀 Analyze & Suggest", type="primary", use_container_width=True):
+        if st.session_state.balance is None:
+            st.error("❌ Enter current balance")
+        else:
+            st.session_state.analysis_done = True
+            st.rerun()
 else:
-    st.info("No setups saved yet in this session.")
+    # Reminder
+    st.info("Analysis locked:")
+    cols = st.columns(4)
+    cols[0].metric("Balance", f"${st.session_state.balance:.2f}")
+    cols[1].metric("Daily Limit", f"${st.session_state.daily_limit:.2f}" if st.session_state.daily_limit else "No limit")
+    cols[2].metric("Floor", f"${st.session_state.floor:.2f}")
+    cols[3].metric("Risk %", f"{st.session_state.risk_pct}%")
 
-# Reset button (to bring back inputs if needed)
-if st.button("Reset Inputs & Start New Analysis"):
+    with st.spinner("Scanning..."):
+        try:
+            price_data = td.price(**{"symbol": "XAU/USD"}).as_json()
+            live_price = float(price_data["price"])
+
+            ts_15m = td.time_series(**{
+                "symbol": "XAU/USD",
+                "interval": "15min",
+                "outputsize": 100
+            }).with_rsi(**{}).with_ema(**{"time_period": 200}).with_ema(**{"time_period": 50}).with_atr(**{"time_period": 14}).as_pandas()
+
+            ts_1h = td.time_series(**{
+                "symbol": "XAU/USD",
+                "interval": "1h",
+                "outputsize": 50
+            }).with_ema(**{"time_period": 200}).as_pandas()
+
+            # SAFE EMA EXTRACTION
+            rsi = ts_15m['rsi'].iloc[0] if 'rsi' in ts_15m.columns else 50.0
+            atr = ts_15m['atr'].iloc[0] if 'atr' in ts_15m.columns else 0.0
+
+            ema_cols = [c for c in ts_15m.columns if 'ema' in c.lower()]
+            if len(ema_cols) >= 2:
+                ema200_15 = ts_15m[ema_cols[0]].iloc[0]
+                ema50_15  = ts_15m[ema_cols[1]].iloc[0]
+            else:
+                ema200_15 = ema50_15 = live_price
+                st.warning("EMA columns not detected — using live price fallback.")
+
+            ema200_1h = ts_1h['ema_1'].iloc[0] if 'ema_1' in ts_1h.columns else live_price
+
+            # TREND ALIGNMENT
+            if (live_price > ema200_15 and live_price > ema200_1h):
+                bias = "BULLISH"
+            elif (live_price < ema200_15 and live_price < ema200_1h):
+                bias = "BEARISH"
+            else:
+                st.warning(f"Trend misalignment – 1H EMA200 at ${ema200_1h:.2f}")
+                st.markdown("**Short explanation:** The 15-minute and 1-hour trends are not aligned. This prevents trades against the larger trend, which often leads to quick stops.")
+                st.markdown("**Suggested action:** Wait approximately **15 minutes** (one full 15-min candle) and press 'Analyze & Suggest' again to check if structure has normalized.")
+                st.stop()
+
+            # Hard lock below floor
+            buffer = st.session_state.balance - st.session_state.floor
+            if buffer <= 0:
+                st.error("Account at or below survival floor — trading locked")
+                st.stop()
+
+            # FRACTALS
+            levels = get_fractal_levels(ts_15m)
+            resistances = sorted([l[1] for l in levels if l[0] == 'RES' and l[1] > live_price])
+            supports = sorted([l[1] for l in levels if l[0] == 'SUP' and l[1] < live_price], reverse=True)
+
+            # ENTRY LOGIC
+            sl_dist = round(atr * 1.5, 2)
+            if bias == "BULLISH":
+                entry = ema50_15 if (live_price - ema50_15) > (atr * 0.5) else live_price
+                sl = supports[0] - (0.3 * atr) if supports else entry - sl_dist
+                tp = resistances[0] if resistances else entry + (sl_dist * 2.5)
+                action_header = "BUY AT MARKET" if entry == live_price else "BUY LIMIT ORDER"
+            else:
+                entry = ema50_15 if (ema50_15 - live_price) > (atr * 0.5) else live_price
+                sl = resistances[0] + (0.3 * atr) if resistances else entry + sl_dist
+                tp = supports[0] if supports else entry - (sl_dist * 2.5)
+                action_header = "SELL AT MARKET" if entry == live_price else "SELL LIMIT ORDER"
+
+            # RISK
+            cash_risk = min(buffer * (st.session_state.risk_pct / 100), st.session_state.daily_limit or buffer)
+
+            if cash_risk < 20:
+                st.warning("Calculated risk too small for minimum lot size – skipping")
+                st.stop()
+
+            sl_dist_actual = abs(entry - sl)
+            lots = max(round(cash_risk / ((sl_dist_actual + SPREAD_BUFFER) * CONTRACT_VALUE), 2), 0.01)
+            actual_risk = round(lots * (sl_dist_actual + SPREAD_BUFFER) * CONTRACT_VALUE, 2)
+
+            # AI OPINIONS FIRST
+            st.divider()
+            st.subheader("AI Opinions")
+            market = {"price": live_price, "rsi": rsi}
+            setup = {"type": bias, "entry": entry, "risk": actual_risk}
+            g_verdict, k_verdict = get_ai_advice(market, setup, levels, buffer)
+
+            col_g, col_k = st.columns(2)
+            with col_g:
+                st.markdown("**Gemini (Cautious)**")
+                st.info(g_verdict)
+            with col_k:
+                st.markdown("**Grok (Direct)**")
+                st.info(k_verdict)
+
+            st.caption("AI opinions are probabilistic assessments, not trading signals.")
+
+            # ACTION BOX
+            st.divider()
+            st.markdown(f"### {action_header}")
+            with st.container(border=True):
+                st.metric("Entry", f"${entry:.2f}")
+                col_sl, col_tp = st.columns(2)
+                col_sl.metric("Stop Loss", f"${sl:.2f}")
+                col_tp.metric("Take Profit", f"${tp:.2f}")
+                col_lots, col_risk = st.columns(2)
+                col_lots.metric("Lots", f"{lots:.2f}")
+                col_risk.metric("Risk Amount", f"${actual_risk:.2f}")
+
+            # Levels
+            with st.expander("Detected Fractal Levels"):
+                st.write("**Resistance above:**", resistances[:3] or "None nearby")
+                st.write("**Support below:**", supports[:3] or "None nearby")
+
+            # Save
+            st.session_state.saved_setups.append({
+                "time": datetime.utcnow().strftime("%H:%M UTC"),
+                "bias": bias,
+                "entry": round(entry, 2),
+                "risk": actual_risk
+            })
+
+            # Update journal
+            journal_df = load_journal()
+            trade_id = datetime.utcnow().strftime("%Y%m%d%H%M%S")
+            new_row = {
+                "id": trade_id,
+                "timestamp": datetime.utcnow().isoformat(),
+                "bias": bias,
+                "entry": round(entry, 2),
+                "stop": round(sl, 2),
+                "target": round(tp, 2),
+                "lots": lots,
+                "risk": actual_risk,
+                "status": "PENDING",
+                "open_time": "",
+                "close_time": "",
+                "close_price": "",
+                "result": ""
+            }
+            journal_df = pd.concat([journal_df, pd.DataFrame([new_row])], ignore_index=True)
+            journal_df = update_journal(journal_df, ts_15m)
+            save_journal(journal_df)
+
+        except Exception as e:
+            st.error(f"Error: {str(e)}")
+
+# ─── JOURNAL ─────────────────────────────────────────────────────────────────
+st.divider()
+st.subheader("Trade Journal")
+journal_df = load_journal()
+if not journal_df.empty:
+    st.dataframe(journal_df.sort_values("timestamp", ascending=False), use_container_width=True)
+else:
+    st.info("No trades logged yet.")
+
+# Reset
+if st.button("Reset & New Analysis"):
     for key in list(st.session_state.keys()):
-        if key.startswith("user_") or key == "analysis_done":
-            del st.session_state[key]
+        del st.session_state[key]
     st.rerun()
