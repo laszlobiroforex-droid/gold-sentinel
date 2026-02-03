@@ -22,14 +22,14 @@ def get_ai_advice(market, account, setup, extra_context):
     - Natural risk floor ~$15–$60 due to min lot + SL distances.
     - User deliberately runs aggressive 25–40% risk of buffer to pass Phase 2 fast.
     - DO NOT suggest lowering % risk — accept the style.
-    - Judge only math, entry quality (pullback confluence, trend support), prop DD safety.
-    - Prefer pullback entries over blind trend chases.
+    - Prefer pullback entries: suggest limit orders at pullback zones if price not there yet.
+    - Judge math, confluence, prop DD safety.
 
     ACCOUNT: ${account['buffer']:.2f} buffer left.
     MARKET: Price ${market['price']:.2f}, RSI {market['rsi']:.1f}, ATR {extra_context['atr']:.2f}, EMA200 {extra_context['ema200']:.2f}, EMA50 {extra_context['ema50']:.2f}
     SETUP: {setup['type']} @ ${setup['entry']:.2f} risking ${setup['risk']:.2f} (SL ~{extra_context['sl_dist']:.2f} pts).
 
-    Blunt verdict: Elite pullback entry with confluence or gambling? 3 sentences max.
+    Blunt: Elite pullback/limit setup or gambling? 3 sentences max.
     """
     try:
         return model.generate_content(prompt).text.strip()
@@ -38,7 +38,7 @@ def get_ai_advice(market, account, setup, extra_context):
 
 # ─── APP ─────────────────────────────────────────────────────────────────────
 st.set_page_config(page_title="Gold Sentinel Pro", page_icon="🥇", layout="wide")
-st.title("🥇 Gold Sentinel Adaptive 7.9")
+st.title("🥇 Gold Sentinel Adaptive 8.0")
 st.caption(f"Phase 2 Protector | {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}")
 
 # Inputs
@@ -84,26 +84,14 @@ if st.button("🚀 Get a Setup!", type="primary", use_container_width=True):
                 ema200 = ts[ema200_col].iloc[0] if ema200_col else live_price
                 ema50 = ts[ema50_col].iloc[0] if ema50_col else live_price
 
-                # ─── PULLBACK-FOCUSED BIAS ──────────────────────────────────────
+                # ─── PULLBACK ZONE CALC ──────────────────────────────────────────
                 sl_dist = round(atr * 1.5, 2)
-                pullback_zone = sl_dist * 1.0  # price near EMA50 within ~1 ATR
+                zone_buffer = sl_dist * 0.8  # zone width around EMA50
 
-                if live_price > ema200:  # overall uptrend
-                    if abs(live_price - ema50) <= pullback_zone and rsi > 35:  # pullback to EMA50, not oversold
-                        bias = "BULLISH PULLBACK"
-                    else:
-                        bias = "NO SETUP – wait for pullback in uptrend"
-                else:  # overall downtrend
-                    if abs(live_price - ema50) <= pullback_zone and rsi < 65:  # rally to EMA50, not overbought
-                        bias = "BEARISH PULLBACK"
-                    else:
-                        bias = "NO SETUP – wait for rally in downtrend"
+                lower_zone = round(ema50 - zone_buffer, 2)
+                upper_zone = round(ema50 + zone_buffer, 2)
 
-                if "NO SETUP" in bias:
-                    st.warning(bias)
-                    st.stop()
-
-                rr_ratio = 4.0 if (rsi < 25 or rsi > 75) else 2.5 if (rsi < 35 or rsi > 65) else 1.3  # lowered min RR
+                rr_ratio = 4.0 if (rsi < 25 or rsi > 75) else 2.5 if (rsi < 35 or rsi > 65) else 1.3
 
                 buffer = balance - survival_floor
                 cash_risk = min(buffer * (risk_pct / 100), daily_limit)
@@ -115,16 +103,46 @@ if st.button("🚀 Get a Setup!", type="primary", use_container_width=True):
                 lots = max(round(cash_risk / ((sl_dist + 0.35) * 100), 2), 0.01)
                 actual_risk = round(lots * (sl_dist + 0.35) * 100, 2)
 
-                entry = live_price
-                sl = round(entry - sl_dist, 2) if "BULLISH" in bias else round(entry + sl_dist, 2)
-                tp = round(entry + (sl_dist * rr_ratio), 2) if "BULLISH" in bias else round(entry - (sl_dist * rr_ratio), 2)
+                # ─── DECIDE ENTRY TYPE ───────────────────────────────────────────
+                if live_price > ema200:  # Uptrend
+                    if live_price >= lower_zone and live_price <= upper_zone and rsi > 35:
+                        bias = "BULLISH PULLBACK – Market Entry"
+                        entry = live_price
+                        sl = round(entry - sl_dist, 2)
+                        tp = round(entry + (sl_dist * rr_ratio), 2)
+                        action = "BUY NOW"
+                        color = "success"
+                    else:
+                        bias = "BULLISH TREND – Wait for Pullback"
+                        entry = round((lower_zone + upper_zone) / 2, 2)  # mid-zone limit
+                        sl = round(entry - sl_dist, 2)
+                        tp = round(entry + (sl_dist * rr_ratio), 2)
+                        action = f"LIMIT BUY @ ~${entry:.2f}"
+                        color = "info"
+                else:  # Downtrend
+                    if live_price <= upper_zone and live_price >= lower_zone and rsi < 65:
+                        bias = "BEARISH PULLBACK – Market Entry"
+                        entry = live_price
+                        sl = round(entry + sl_dist, 2)
+                        tp = round(entry - (sl_dist * rr_ratio), 2)
+                        action = "SELL NOW"
+                        color = "warning"
+                    else:
+                        bias = "BEARISH TREND – Wait for Rally"
+                        entry = round((lower_zone + upper_zone) / 2, 2)
+                        sl = round(entry + sl_dist, 2)
+                        tp = round(entry - (sl_dist * rr_ratio), 2)
+                        action = f"LIMIT SELL @ ~${entry:.2f}"
+                        color = "info"
 
                 # Display
                 st.subheader(f"Bias: {bias}")
-                if "BULLISH" in bias:
-                    st.success(f"📈 BUY @ ${entry:.2f}")
+                if color == "success":
+                    st.success(f"📈 {action} @ ${entry:.2f}")
+                elif color == "warning":
+                    st.warning(f"📉 {action} @ ${entry:.2f}")
                 else:
-                    st.warning(f"📉 SELL @ ${entry:.2f}")
+                    st.info(f"⏳ {action}")
 
                 c1, c2, c3, c4 = st.columns(4)
                 c1.metric("Lots", f"{lots:.2f}")
@@ -133,6 +151,7 @@ if st.button("🚀 Get a Setup!", type="primary", use_container_width=True):
                 c4.metric("Buffer $", f"{buffer:.2f}")
 
                 st.write(f"**SL:** ${sl:.2f} | **TP:** ${tp:.2f}")
+                st.caption(f"Pullback zone around EMA50: ${lower_zone:.2f} – ${upper_zone:.2f}")
 
                 # Save
                 setup_record = {
