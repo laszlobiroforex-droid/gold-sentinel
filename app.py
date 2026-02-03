@@ -6,6 +6,11 @@ import google.generativeai as genai
 from openai import OpenAI
 from datetime import datetime
 
+st.markdown("""
+<script src="//cdn.jsdelivr.net/npm/eruda"></script>
+<script>eruda.init();</script>
+""", unsafe_allow_html=True)
+
 # ─── API INIT ────────────────────────────────────────────────────────────────
 try:
     td = TDClient(apikey=st.secrets["TWELVE_DATA_KEY"])
