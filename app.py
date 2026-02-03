@@ -10,37 +10,38 @@ try:
     genai.configure(api_key=st.secrets["GEMINI_KEY"])
     model = genai.GenerativeModel('gemini-2.5-flash')
 except Exception as e:
-    st.error(f"❌ API setup failed: {str(e)}\nVerify secrets: TWELVE_DATA_KEY and GEMINI_KEY")
+    st.error(f"❌ API setup failed: {str(e)}\nVerify secrets.")
     st.stop()
 
-# ─── IMPROVED AI AUDITOR ─────────────────────────────────────────────────────
+# ─── AI AUDITOR ──────────────────────────────────────────────────────────────
 def get_ai_advice(market, account, setup, extra_context):
     prompt = f"""
     SYSTEM: You are a high-stakes risk auditor for RebelsFunding Copper 5K Phase 2 challenge.
     USER CONSTRAINTS & STRATEGY:
-    - Minimum lot size is 0.01 on XAU/USD → 0.01 lot = $1 P/L per $1 price move.
-    - This creates a natural minimum risk floor of roughly $15–$60 depending on SL distance (cannot go meaningfully below ~$20 risk without violating min lot).
-    - The user is DELIBERATELY using aggressive 25–40% risk-per-trade of remaining buffer to push through Phase 2 quickly.
-    - DO NOT advise lowering the risk percentage — accept it as the chosen style.
-    - Focus ONLY on: math consistency, entry quality (trend confluence from provided indicators), prop-rule safety (daily/overall DD not breached), and whether the entry looks elite or gambling given the data.
+    - Min lot 0.01 on XAU/USD → $1 P/L per $1 move.
+    - Natural risk floor ~$15–$60 due to min lot + SL distances.
+    - User deliberately runs aggressive 25–40% risk of buffer to pass Phase 2 fast.
+    - DO NOT suggest lowering % risk — accept the style.
+    - Judge only math, entry quality (pullback confluence, trend support), prop DD safety.
+    - Prefer pullback entries over blind trend chases.
 
-    ACCOUNT: ${account['buffer']:.2f} buffer left above $4500 floor.
-    MARKET CONTEXT: Price ${market['price']:.2f}, RSI {market['rsi']:.1f}, ATR(14) {extra_context['atr']:.2f}, EMA200 {extra_context['ema200']:.2f}, EMA50 {extra_context['ema50']:.2f}
-    PROPOSED SETUP: {setup['type']} at ${setup['entry']:.2f} with ${setup['risk']:.2f} risk (SL distance implied ~{extra_context['sl_dist']:.2f} points).
+    ACCOUNT: ${account['buffer']:.2f} buffer left.
+    MARKET: Price ${market['price']:.2f}, RSI {market['rsi']:.1f}, ATR {extra_context['atr']:.2f}, EMA200 {extra_context['ema200']:.2f}, EMA50 {extra_context['ema50']:.2f}
+    SETUP: {setup['type']} @ ${setup['entry']:.2f} risking ${setup['risk']:.2f} (SL ~{extra_context['sl_dist']:.2f} pts).
 
-    Be blunt: Is this an elite, math-consistent entry with some confluence, or pure gambling? 3 sentences max.
+    Blunt verdict: Elite pullback entry with confluence or gambling? 3 sentences max.
     """
     try:
         return model.generate_content(prompt).text.strip()
     except:
-        return "Auditor offline — verify math manually."
+        return "Auditor offline."
 
-# ─── APP CONFIG ──────────────────────────────────────────────────────────────
+# ─── APP ─────────────────────────────────────────────────────────────────────
 st.set_page_config(page_title="Gold Sentinel Pro", page_icon="🥇", layout="wide")
-st.title("🥇 Gold Sentinel Adaptive 7.8")
+st.title("🥇 Gold Sentinel Adaptive 7.9")
 st.caption(f"Phase 2 Protector | {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}")
 
-# ─── INPUTS ──────────────────────────────────────────────────────────────────
+# Inputs
 st.header("Account Health")
 col1, col2 = st.columns(2)
 with col1:
@@ -56,60 +57,71 @@ risk_pct = st.slider("Risk % of Buffer", 10, 50, 25, step=5)
 if 'saved_setups' not in st.session_state:
     st.session_state.saved_setups = []
 
-# ─── MAIN LOGIC ──────────────────────────────────────────────────────────────
+# Main button
 if st.button("🚀 Get a Setup!", type="primary", use_container_width=True):
     if balance is None or daily_limit is None or balance <= survival_floor:
-        st.error("❌ Enter valid account values!")
+        st.error("❌ Enter valid values!")
     else:
-        with st.spinner("Fetching XAU/USD data..."):
+        with st.spinner("Analyzing..."):
             try:
-                # Price fetch
                 price_data = td.price(**{"symbol": "XAU/USD"}).as_json()
                 live_price = float(price_data["price"])
 
-                # Time series (for RSI, ATR, EMAs used in logic & auditor)
                 ts = td.time_series(**{
                     "symbol": "XAU/USD",
                     "interval": "15min",
                     "outputsize": 100
                 }).with_rsi(**{}).with_ema(**{"time_period": 200}).with_ema(**{"time_period": 50}).with_atr(**{"time_period": 14}).as_pandas()
 
-                # Column extraction
-                rsi_col  = next((c for c in ts.columns if 'rsi'  in c.lower()), None)
-                atr_col  = next((c for c in ts.columns if 'atr'  in c.lower()), None)
-                ema_cols = [c for c in ts.columns if 'ema' in c.lower()]
-                ema_cols.sort()
-                ema200_col = ema_cols[0] if len(ema_cols) > 0 else None
-                ema50_col  = ema_cols[1] if len(ema_cols) > 1 else None
+                rsi_col = next((c for c in ts.columns if 'rsi' in c.lower()), None)
+                atr_col = next((c for c in ts.columns if 'atr' in c.lower()), None)
+                ema_cols = sorted([c for c in ts.columns if 'ema' in c.lower()])
+                ema200_col = ema_cols[0] if ema_cols else None
+                ema50_col = ema_cols[1] if len(ema_cols) > 1 else None
 
-                rsi    = ts[rsi_col].iloc[0] if rsi_col else 50.0
-                atr    = ts[atr_col].iloc[0] if atr_col else 0.0
+                rsi = ts[rsi_col].iloc[0] if rsi_col else 50.0
+                atr = ts[atr_col].iloc[0] if atr_col else 0.0
                 ema200 = ts[ema200_col].iloc[0] if ema200_col else live_price
-                ema50  = ts[ema50_col].iloc[0] if ema50_col else live_price
+                ema50 = ts[ema50_col].iloc[0] if ema50_col else live_price
 
-                bias = "BULLISH" if live_price > ema200 else "BEARISH"
-
+                # ─── PULLBACK-FOCUSED BIAS ──────────────────────────────────────
                 sl_dist = round(atr * 1.5, 2)
-                spread  = 0.35
-                rr_ratio = 4.0 if (rsi < 25 or rsi > 75) else 2.5 if (rsi < 35 or rsi > 65) else 1.8
+                pullback_zone = sl_dist * 1.0  # price near EMA50 within ~1 ATR
 
-                buffer     = balance - survival_floor
-                cash_risk  = min(buffer * (risk_pct / 100), daily_limit)
+                if live_price > ema200:  # overall uptrend
+                    if abs(live_price - ema50) <= pullback_zone and rsi > 35:  # pullback to EMA50, not oversold
+                        bias = "BULLISH PULLBACK"
+                    else:
+                        bias = "NO SETUP – wait for pullback in uptrend"
+                else:  # overall downtrend
+                    if abs(live_price - ema50) <= pullback_zone and rsi < 65:  # rally to EMA50, not overbought
+                        bias = "BEARISH PULLBACK"
+                    else:
+                        bias = "NO SETUP – wait for rally in downtrend"
 
-                if cash_risk < 20 or rr_ratio < 1.8:
-                    st.warning(f"Risk ${cash_risk:.2f} too small for min lot or RR weak — skipping.")
+                if "NO SETUP" in bias:
+                    st.warning(bias)
                     st.stop()
 
-                lots        = max(round(cash_risk / ((sl_dist + spread) * 100), 2), 0.01)
-                actual_risk = round(lots * (sl_dist + spread) * 100, 2)
+                rr_ratio = 4.0 if (rsi < 25 or rsi > 75) else 2.5 if (rsi < 35 or rsi > 65) else 1.3  # lowered min RR
+
+                buffer = balance - survival_floor
+                cash_risk = min(buffer * (risk_pct / 100), daily_limit)
+
+                if cash_risk < 20:
+                    st.warning(f"Risk ${cash_risk:.2f} too small for min lot — skipping.")
+                    st.stop()
+
+                lots = max(round(cash_risk / ((sl_dist + 0.35) * 100), 2), 0.01)
+                actual_risk = round(lots * (sl_dist + 0.35) * 100, 2)
 
                 entry = live_price
-                sl = round(entry - sl_dist, 2) if bias == "BULLISH" else round(entry + sl_dist, 2)
-                tp = round(entry + (sl_dist * rr_ratio), 2) if bias == "BULLISH" else round(entry - (sl_dist * rr_ratio), 2)
+                sl = round(entry - sl_dist, 2) if "BULLISH" in bias else round(entry + sl_dist, 2)
+                tp = round(entry + (sl_dist * rr_ratio), 2) if "BULLISH" in bias else round(entry - (sl_dist * rr_ratio), 2)
 
-                # ─── OUTPUT ──────────────────────────────────────────────────────
+                # Display
                 st.subheader(f"Bias: {bias}")
-                if bias == "BULLISH":
+                if "BULLISH" in bias:
                     st.success(f"📈 BUY @ ${entry:.2f}")
                 else:
                     st.warning(f"📉 SELL @ ${entry:.2f}")
@@ -122,9 +134,7 @@ if st.button("🚀 Get a Setup!", type="primary", use_container_width=True):
 
                 st.write(f"**SL:** ${sl:.2f} | **TP:** ${tp:.2f}")
 
-                # No chart section at all
-
-                # Save to history
+                # Save
                 setup_record = {
                     "time": datetime.utcnow().strftime("%H:%M UTC"),
                     "bias": bias,
@@ -144,7 +154,7 @@ if st.button("🚀 Get a Setup!", type="primary", use_container_width=True):
                 st.info(get_ai_advice(market_data, account_data, setup_data, extra))
 
             except Exception as e:
-                st.error(f"Market error: {str(e)}\nTry refreshing or check rate limits")
+                st.error(f"Error: {str(e)}")
 
 # ─── HISTORY ─────────────────────────────────────────────────────────────────
 st.divider()
