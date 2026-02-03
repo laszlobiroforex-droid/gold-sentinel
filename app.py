@@ -20,6 +20,19 @@ st.markdown("""
 </script>
 """, unsafe_allow_html=True)
 
+if st.button("Force Open Eruda Console"):
+    st.markdown("""
+    <script>
+      if (typeof eruda !== 'undefined') {
+        eruda.init();
+        eruda.show();
+        console.log("Eruda forced open");
+      } else {
+        console.log("Eruda not loaded");
+      }
+    </script>
+    """, unsafe_allow_html=True)
+
 # ─── API INIT ────────────────────────────────────────────────────────────────
 try:
     td = TDClient(apikey=st.secrets["TWELVE_DATA_KEY"])
