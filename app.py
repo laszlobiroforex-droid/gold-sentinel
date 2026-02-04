@@ -16,8 +16,11 @@ try:
         api_key=st.secrets["GROK_API_KEY"],
         base_url="https://api.x.ai/v1",
     )
+
+    openai_client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
+
 except Exception as e:
-    st.error(f"API setup failed: {e}\nCheck secrets: TWELVE_DATA_KEY, GEMINI_KEY, GROK_API_KEY")
+    st.error(f"API setup failed: {e}\nCheck secrets: TWELVE_DATA_KEY, GEMINI_KEY, GROK_API_KEY, OPENAI_API_KEY")
     st.stop()
 
 # ─── FRACTAL LEVELS ──────────────────────────────────────────────────────────
@@ -30,7 +33,7 @@ def get_fractal_levels(df, window=5):
             levels.append(('SUP', round(df['low'].iloc[i], 2)))
     return levels
 
-# ─── DUAL AUDITORS ───────────────────────────────────────────────────────────
+# ─── TRIPLE AUDITORS ─────────────────────────────────────────────────────────
 def get_ai_advice(market, setup, levels, buffer, mode):
     levels_str = ", ".join([f"{l[0]}@{l[1]}" for l in levels[-5:]]) if levels else "No clear levels"
     prompt = f"""
@@ -59,11 +62,14 @@ def get_ai_advice(market, setup, levels, buffer, mode):
     If no meaningful change is needed, just say "No better alternative".
     Keep total response under 5 sentences.
     """
+
+    # Gemini
     try:
         g_out = gemini_model.generate_content(prompt).text.strip()
     except:
         g_out = "Gemini Offline."
 
+    # Grok
     try:
         r = grok_client.chat.completions.create(
             model="grok-4",
@@ -73,8 +79,20 @@ def get_ai_advice(market, setup, levels, buffer, mode):
         k_out = r.choices[0].message.content.strip()
     except Exception as e:
         k_out = f"Grok Error: {e}"
-    
-    return g_out, k_out
+
+    # ChatGPT (gpt-4o-mini)
+    try:
+        response = openai_client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=220,
+            temperature=0.7
+        )
+        c_out = response.choices[0].message.content.strip()
+    except Exception as e:
+        c_out = f"ChatGPT Error: {e}"
+
+    return g_out, k_out, c_out
 
 # ─── APP ─────────────────────────────────────────────────────────────────────
 st.set_page_config(page_title="Gold Sentinel Pro", page_icon="🥇", layout="wide")
@@ -150,7 +168,6 @@ else:
                 "outputsize": 100
             }).with_rsi(**{}).with_ema(**{"time_period": 200}).with_ema(**{"time_period": 50}).with_atr(**{"time_period": 14}).as_pandas()
 
-            # Higher or lower timeframe
             if st.session_state.mode.startswith("Standard"):
                 ts_htf = td.time_series(**{
                     "symbol": "XAU/USD",
@@ -195,7 +212,7 @@ else:
             resistances = sorted([l[1] for l in levels if l[0] == 'RES' and l[1] > live_price])
             supports = sorted([l[1] for l in levels if l[0] == 'SUP' and l[1] < live_price], reverse=True)
 
-            # ─── CALCULATE ORIGINAL SETUP (for AI to review) ─────────────────────
+            # ─── CALCULATE ORIGINAL SETUP ────────────────────────────────────────
             sl_dist = round(atr * 1.5, 2)
             min_sl_distance = atr * 0.4
             min_rr = 1.2
@@ -220,32 +237,53 @@ else:
                 
                 tp = supports[0] if supports else entry - (sl_dist * 2.5)
 
-            # ─── RISK CALC EARLY (FIXED SCOPE) ───────────────────────────────────
+            # ─── RISK CALC EARLY ─────────────────────────────────────────────────
             buffer = st.session_state.balance - st.session_state.floor
             cash_risk = min(buffer * (st.session_state.risk_pct / 100), st.session_state.daily_limit or buffer)
 
-            # ─── DYNAMIC MIN RISK ────────────────────────────────────────────────
-            min_risk_vol = atr * 100 * 0.01 * 2       # 2×ATR worth of 0.01 lot
-            min_risk_pct = buffer * 0.005             # 0.5% of buffer
-            min_risk_hard = 10                        # absolute floor
+            # Dynamic min risk
+            min_risk_vol = atr * 100 * 0.01 * 2
+            min_risk_pct = buffer * 0.005
+            min_risk_hard = 10
             min_risk_overall = max(min_risk_vol, min_risk_pct, min_risk_hard)
 
-            # ─── AI OPINIONS FIRST (always run) ──────────────────────────────────
-            st.divider()
-            st.subheader("AI Opinions")
-            market = {"price": live_price, "rsi": rsi}
-            setup = {"type": bias, "entry": entry, "risk": cash_risk}
-            g_verdict, k_verdict = get_ai_advice(market, setup, levels, buffer, st.session_state.mode)
+            # Temporary lots/risk for AI
+            sl_dist_actual_temp = abs(entry - sl)
+            lots_temp = max(round(cash_risk / ((sl_dist_actual_temp + 0.35) * 100), 2), 0.01) if sl_dist_actual_temp > 0 else 0.01
+            actual_risk_temp = round(lots_temp * (sl_dist_actual_temp + 0.35) * 100, 2)
 
-            col_g, col_k = st.columns(2)
-            with col_g:
+            # ─── TRIPLE AI OPINIONS ──────────────────────────────────────────────
+            st.divider()
+            st.subheader("Triple AI Opinions")
+            market = {"price": live_price, "rsi": rsi}
+            setup = {"type": bias, "entry": entry, "risk": actual_risk_temp}
+            g_verdict, k_verdict, c_verdict = get_ai_advice(market, setup, levels, buffer, st.session_state.mode)
+
+            col1, col2, col3 = st.columns(3)
+            with col1:
                 st.markdown("**Gemini (Cautious)**")
                 st.info(g_verdict)
-            with col_k:
+            with col2:
                 st.markdown("**Grok (Direct)**")
                 st.info(k_verdict)
+            with col3:
+                st.markdown("**ChatGPT (Balanced)**")
+                st.info(c_verdict)
 
             st.caption("AI opinions are probabilistic assessments, not trading signals.")
+
+            # ─── CONSENSUS SUMMARY ───────────────────────────────────────────────
+            verdicts = [g_verdict.lower(), k_verdict.lower(), c_verdict.lower()]
+            proposals = sum(1 for v in verdicts if "proposal:" in v)
+            elite_count = sum(1 for v in verdicts if "elite" in v)
+            gamble_count = sum(1 for v in verdicts if "gamble" in v or "low-edge" in v)
+
+            if elite_count >= 2:
+                st.success(f"Strong consensus ({elite_count}/3 elite) — high-conviction setup likely")
+            elif gamble_count >= 2:
+                st.warning(f"Caution consensus ({gamble_count}/3 gamble/low-edge) — review carefully")
+            else:
+                st.info(f"Mixed opinions — {proposals} AI(s) proposed changes. Review all three.")
 
             # ─── APPLY HARD FILTERS AFTER AI ─────────────────────────────────────
             valid_direction = (bias == "BULLISH" and sl < entry) or (bias == "BEARISH" and sl > entry)
@@ -253,14 +291,20 @@ else:
             reward_dist = abs(tp - entry)
             actual_rr = reward_dist / risk_dist if risk_dist > 0 else 0.0
 
+            setup_valid = True
+            warning_msgs = []
+
             if cash_risk < min_risk_overall:
-                st.warning(f"Risk too small (\( {cash_risk:.2f}) vs dynamic min ( \){min_risk_overall:.2f} – volatility & buffer adjusted) – see AI opinions for alternatives or skip")
-            elif not valid_direction:
-                st.error("Invalid risk direction (SL on wrong side of entry) – see AI opinions for alternatives")
-            elif actual_rr < min_rr:
-                st.warning(f"Reward:risk too low ({actual_rr:.2f}:1) – see AI opinions for alternatives or skip")
-            else:
-                # Valid — show setup
+                warning_msgs.append(f"Risk too small (\( {cash_risk:.2f}) vs dynamic min ( \){min_risk_overall:.2f})")
+                setup_valid = False
+            if not valid_direction:
+                warning_msgs.append("Invalid risk direction (SL on wrong side of entry)")
+                setup_valid = False
+            if actual_rr < min_rr:
+                warning_msgs.append(f"Reward:risk too low ({actual_rr:.2f}:1)")
+                setup_valid = False
+
+            if setup_valid:
                 sl_dist_actual = risk_dist
                 lots = max(round(cash_risk / ((sl_dist_actual + 0.35) * 100), 2), 0.01)
                 actual_risk = round(lots * (sl_dist_actual + 0.35) * 100, 2)
@@ -278,12 +322,15 @@ else:
                     col_rr = st.columns(1)[0]
                     col_rr.metric("Actual R:R", f"1:{actual_rr:.2f}")
 
+            else:
+                st.warning("Setup rejected by filters:\n" + "\n".join(warning_msgs) + "\nSee AI opinions for alternatives or skip")
+
             # Levels (always show)
             with st.expander("Detected Fractal Levels"):
                 st.write("**Resistance above:**", resistances[:3] or "None nearby")
                 st.write("**Support below:**", supports[:3] or "None nearby")
 
-            # Accept button (placeholder)
+            # Accept button
             if st.button("✅ Accept This Setup"):
                 st.success("Setup accepted! (Notification pause logic can be added in PWA version)")
 
@@ -295,10 +342,10 @@ else:
                 "entry": round(entry, 2),
                 "sl": round(sl, 2),
                 "tp": round(tp, 2),
-                "lots": lots,
+                "lots": lots_temp if 'lots_temp' in locals() else 0.01,
                 "risk": cash_risk,
                 "rr": actual_rr,
-                "status": "Rejected by filters" if cash_risk < min_risk_overall or not valid_direction or actual_rr < min_rr else "Valid"
+                "status": "Rejected by filters" if not setup_valid else "Valid"
             })
 
         except Exception as e:
