@@ -16,8 +16,8 @@ import os
 # ─── CONFIG ──────────────────────────────────────────────────────────────────
 SPREAD_BUFFER_POINTS = 0.30
 SLIPPAGE_BUFFER_POINTS = 0.20
-COMMISSION_PER_LOT_RT = 1.00     # USD round-turn per lot
-PIP_VALUE = 100                  # $ per 1.00 move per standard lot
+COMMISSION_PER_LOT_RT = 1.00
+PIP_VALUE = 100
 
 ALERT_COOLDOWN_MIN = 30
 MIN_CONVICTION_FOR_ALERT = 2     # 2 or 3 AIs saying ELITE/HIGH_CONV
@@ -66,7 +66,7 @@ def send_telegram(message: str, priority: str = "normal"):
     token = st.secrets.get("TELEGRAM_BOT_TOKEN")
     chat_id = st.secrets.get("TELEGRAM_CHAT_ID")
     if not token or not chat_id:
-        return  # silently skip if not configured
+        return
 
     emoji = "🟢 ELITE" if priority == "high" else "🔵 Conviction"
     text = f"{emoji} Gold Setup Alert\n\n{message}\n\n{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"
@@ -93,25 +93,32 @@ def get_fractal_levels(df, window=5, min_dist_factor=0.4):
                 levels.append(('SUP', price))
     return sorted(levels, key=lambda x: x[1], reverse=True)
 
-# ─── CACHED DATA FETCH ───────────────────────────────────────────────────────
+# ─── FIXED DATA FETCH ────────────────────────────────────────────────────────
 @st.cache_data(ttl=300)
 @retry_api()
 def fetch_15m_data():
-    return td.time_series(**{
-        "symbol": "XAU/USD",
-        "interval": "15min",
-        "outputsize": 500
-    }).with_rsi({}).with_ema({"time_period": 200}).with_ema({"time_period": 50}).with_atr({"time_period": 14}).as_pandas()
+    ts = td.time_series(
+        symbol="XAU/USD",
+        interval="15min",
+        outputsize=500
+    )
+    ts = ts.with_rsi()                     # default period=14
+    ts = ts.with_ema(time_period=200)
+    ts = ts.with_ema(time_period=50)
+    ts = ts.with_atr(time_period=14)
+    return ts.as_pandas()
 
 @st.cache_data(ttl=300)
 @retry_api()
 def fetch_htf_data(interval):
     out_size = 500 if interval == "5min" else 200
-    return td.time_series(**{
-        "symbol": "XAU/USD",
-        "interval": interval,
-        "outputsize": out_size
-    }).with_ema({"time_period": 200}).as_pandas()
+    ts = td.time_series(
+        symbol="XAU/USD",
+        interval=interval,
+        outputsize=out_size
+    )
+    ts = ts.with_ema(time_period=200)
+    return ts.as_pandas()
 
 @st.cache_data(ttl=60)
 @retry_api()
@@ -245,10 +252,9 @@ def check_for_high_conviction_setup():
         atr = latest_15m.get('atr', 10.0)
 
         market = {"price": live_price, "rsi": rsi}
-        # Minimal setup dict just for AI prompt
         setup = {"type": "UNKNOWN", "entry": live_price, "sl_distance": atr*1.5, "atr": atr, "risk_pct": DEFAULT_RISK_PCT}
         levels = get_fractal_levels(ts_15m)
-        buffer = DEFAULT_BALANCE - DEFAULT_FLOOR   # fallback
+        buffer = DEFAULT_BALANCE - DEFAULT_FLOOR
 
         g_raw, k_raw, c_raw = get_ai_advice(market, setup, levels, buffer, DEFAULT_MODE)
         g_p = parse_ai_output(g_raw)
@@ -260,8 +266,8 @@ def check_for_high_conviction_setup():
         if high_count >= MIN_CONVICTION_FOR_ALERT:
             direction = g_p.get("direction") or "UNKNOWN"
             entry = g_p.get("entry") or live_price
-            sl = g_p.get("sl") or (entry - atr*1.5 if direction == "BULLISH" else entry + atr*1.5)
-            tp = g_p.get("tp") or (entry + atr*3 if direction == "BULLISH" else entry - atr*3)
+            sl = g_p.get("sl") or (entry - atr*1.5 if direction.startswith("BULL") else entry + atr*1.5)
+            tp = g_p.get("tp") or (entry + atr*3 if direction.startswith("BULL") else entry - atr*3)
             rr = g_p.get("rr") or 2.0
 
             key = f"{direction}_{entry:.2f}_{sl:.2f}"
@@ -270,7 +276,9 @@ def check_for_high_conviction_setup():
 
             msg = (
                 f"**High Conviction Setup!** ({high_count}/3 AIs)\n"
-                f"Direction: {direction}\nEntry: ${entry:.2f}\nSL: ${sl:.2f}\n"
+                f"Direction: {direction}\n"
+                f"Entry: ${entry:.2f}\n"
+                f"SL: ${sl:.2f}\n"
                 f"TP: ${tp:.2f}   (R:R ~1:{rr:.1f})\n"
                 f"Current price: ${live_price:.2f} | RSI {rsi:.1f}"
             )
@@ -281,7 +289,7 @@ def check_for_high_conviction_setup():
             st.session_state.last_alerted_key = key
 
     except Exception:
-        pass  # silent fail on background check
+        pass
 
 # ─── BACKGROUND THREAD ───────────────────────────────────────────────────────
 def run_background_checker():
@@ -374,7 +382,6 @@ else:
             levels = get_fractal_levels(ts_15m)
             buffer = st.session_state.balance - st.session_state.floor
 
-            # Minimal setup for AI prompt
             setup_placeholder = {
                 "type": "PULLBACK",
                 "entry": live_price,
@@ -417,7 +424,7 @@ else:
             else:
                 st.markdown("Mixed AI views – review carefully")
 
-            # ── Now try your original logic (secondary) ──────────────────────
+            # ── Your original logic (secondary) ─────────────────────────────────
             st.divider()
             st.subheader("Your Structured Setup (secondary check)")
             try:
@@ -428,7 +435,9 @@ else:
                 ema_cols_15m = sorted([c for c in ts_15m.columns if 'ema' in c.lower()])
                 ema200_15m = latest_15m[ema_cols_15m[0]] if ema_cols_15m else live_price
                 ema50_15m  = latest_15m[ema_cols_15m[1]] if len(ema_cols_15m) >= 2 else live_price
-                ema200_htf = latest_htf[sorted([c for c in ts_htf.columns if 'ema' in c.lower()])[0]] if ts_htf.columns else live_price
+
+                ema_cols_htf = [c for c in ts_htf.columns if 'ema' in c.lower()]
+                ema200_htf = latest_htf[sorted(ema_cols_htf)[0]] if ema_cols_htf else live_price
 
                 aligned = (live_price > ema200_15m and live_price > ema200_htf) or \
                           (live_price < ema200_15m and live_price < ema200_htf)
@@ -493,8 +502,9 @@ else:
                     setup_valid = True
                     warnings = []
 
-                    if cash_risk < max(atr * 100 * 0.01 * 2, buffer * 0.005, 10):
-                        warnings.append("Risk amount too small")
+                    min_risk = max(atr * 100 * 0.01 * 2, buffer * 0.005, 10)
+                    if cash_risk < min_risk:
+                        warnings.append(f"Risk amount too small (${cash_risk:.2f} < ${min_risk:.2f})")
                         setup_valid = False
                     if not ((bias == "BULLISH" and final_sl < final_entry) or (bias == "BEARISH" and final_sl > final_entry)):
                         warnings.append("Invalid SL direction")
@@ -504,7 +514,8 @@ else:
                         setup_valid = False
 
                     if setup_valid:
-                        st.markdown(f"### Recommended: {original_action if not override_applied else 'AI-ADJUSTED ' + ('BUY LIMIT' if bias == 'BULLISH' else 'SELL LIMIT')}")
+                        action_text = original_action if not override_applied else f"AI-ADJUSTED {'BUY LIMIT' if bias == 'BULLISH' else 'SELL LIMIT'}"
+                        st.markdown(f"### Recommended: {action_text}")
                         with st.container(border=True):
                             st.metric("Entry", f"${final_entry:.2f}")
                             col_sl, col_tp = st.columns(2)
@@ -531,4 +542,4 @@ else:
                 st.rerun()
 
         except Exception as e:
-            st.error(f"Core data / AI fetch failed: {e}\nTry again in a few minutes.")
+            st.error(f"Core data / AI fetch failed: {str(e)}\nTry again in a few minutes.")
