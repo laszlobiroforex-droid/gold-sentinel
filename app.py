@@ -42,7 +42,7 @@ def get_ai_advice(market, setup, levels, buffer, mode):
 
     Current UTC time: {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}
     NY session close ~22:00 UTC — factor in thinning liquidity and whipsaw risk after 21:30 UTC.
-    If any high-impact news (FOMC, NFP, CPI, Fed speakers, geopolitical) likely within ±30 min, prefer to wait unless setup is exceptionally strong.
+    If any high-impact news likely within ±30 min, prefer to wait unless setup is exceptionally strong.
 
     Buffer left: ${buffer:.2f}
     Market: Price ${market['price']:.2f}, RSI {market['rsi']:.1f}
@@ -195,7 +195,7 @@ else:
             resistances = sorted([l[1] for l in levels if l[0] == 'RES' and l[1] > live_price])
             supports = sorted([l[1] for l in levels if l[0] == 'SUP' and l[1] < live_price], reverse=True)
 
-            # ─── PULLBACK ENTRY + FORCED CORRECT SL DIRECTION ────────────────────
+            # ─── CALCULATE ORIGINAL SETUP (for AI to review) ─────────────────────
             sl_dist = round(atr * 1.5, 2)
             min_sl_distance = atr * 0.4
             min_rr = 1.2
@@ -203,27 +203,12 @@ else:
             if bias == "BULLISH":
                 entry = ema50_15m if (live_price - ema50_15m) > (atr * 0.5) else live_price
                 
-                # Valid support BELOW entry
                 valid_sup = [s for s in supports if s < entry]
                 candidate_sl = valid_sup[0] - (0.3 * atr) if valid_sup else entry - sl_dist
                 
                 sl = min(candidate_sl, entry - min_sl_distance)
                 
-                if sl >= entry:
-                    st.warning("No valid stop-loss below entry – setup skipped")
-                    st.stop()
-
                 tp = resistances[0] if resistances else entry + (sl_dist * 2.5)
-
-                risk_dist = entry - sl
-                reward_dist = tp - entry
-                actual_rr = (reward_dist / risk_dist) if risk_dist > 0 else 0.0
-                
-                if actual_rr < min_rr:
-                    st.warning(f"Reward:risk too low ({actual_rr:.2f}:1) – setup skipped")
-                    st.stop()
-
-                action_header = "BUY AT MARKET" if entry == live_price else "BUY LIMIT ORDER"
 
             else:
                 entry = ema50_15m if (ema50_15m - live_price) > (atr * 0.5) else live_price
@@ -233,39 +218,18 @@ else:
                 
                 sl = max(candidate_sl, entry + min_sl_distance)
                 
-                if sl <= entry:
-                    st.warning("No valid stop-loss above entry – setup skipped")
-                    st.stop()
-
                 tp = supports[0] if supports else entry - (sl_dist * 2.5)
 
-                risk_dist = sl - entry
-                reward_dist = entry - tp
-                actual_rr = (reward_dist / risk_dist) if risk_dist > 0 else 0.0
-                
-                if actual_rr < min_rr:
-                    st.warning(f"Reward:risk too low ({actual_rr:.2f}:1) – setup skipped")
-                    st.stop()
+            # Temporary risk calc for AI (may be invalid direction)
+            temp_sl_dist = abs(entry - sl)
+            temp_lots = max(round(cash_risk / ((temp_sl_dist + 0.35) * 100), 2), 0.01)
+            temp_risk = round(temp_lots * (temp_sl_dist + 0.35) * 100, 2)
 
-                action_header = "SELL AT MARKET" if entry == live_price else "SELL LIMIT ORDER"
-
-            # ─── RISK & SAFETY ───────────────────────────────────────────────────
-            buffer = st.session_state.balance - st.session_state.floor
-            cash_risk = min(buffer * (st.session_state.risk_pct / 100), st.session_state.daily_limit or buffer)
-
-            if cash_risk < 20:
-                st.warning("Calculated risk too small for minimum lot size – skipping")
-                st.stop()
-
-            sl_dist_actual = abs(entry - sl)
-            lots = max(round(cash_risk / ((sl_dist_actual + 0.35) * 100), 2), 0.01)
-            actual_risk = round(lots * (sl_dist_actual + 0.35) * 100, 2)
-
-            # ─── AI OPINIONS FIRST ───────────────────────────────────────────────
+            # ─── AI OPINIONS FIRST (always show) ─────────────────────────────────
             st.divider()
             st.subheader("AI Opinions")
             market = {"price": live_price, "rsi": rsi}
-            setup = {"type": bias, "entry": entry, "risk": actual_risk}
+            setup = {"type": bias, "entry": entry, "risk": temp_risk}
             g_verdict, k_verdict = get_ai_advice(market, setup, levels, buffer, st.session_state.mode)
 
             col_g, col_k = st.columns(2)
@@ -278,30 +242,39 @@ else:
 
             st.caption("AI opinions are probabilistic assessments, not trading signals.")
 
-            # ─── ACTION BOX AFTER AI ─────────────────────────────────────────────
-            st.divider()
-            st.markdown(f"### {action_header}")
-            with st.container(border=True):
-                st.metric("Entry", f"${entry:.2f}")
-                col_sl, col_tp = st.columns(2)
-                col_sl.metric("Stop Loss", f"${sl:.2f}")
-                col_tp.metric("Take Profit", f"${tp:.2f}")
-                col_lots, col_risk = st.columns(2)
-                col_lots.metric("Lots", f"{lots:.2f}")
-                col_risk.metric("Risk Amount", f"${actual_risk:.2f}")
-                col_rr = st.columns(1)[0]
-                col_rr.metric("Actual R:R", f"1:{actual_rr:.2f}")
+            # ─── NOW APPLY HARD FILTERS ──────────────────────────────────────────
+            valid_direction = (bias == "BULLISH" and sl < entry) or (bias == "BEARISH" and sl > entry)
+            risk_dist = abs(entry - sl)
+            reward_dist = abs(tp - entry)
+            actual_rr = reward_dist / risk_dist if risk_dist > 0 else 0.0
 
-            # Levels
+            if not valid_direction:
+                st.error("Invalid risk direction (SL on wrong side of entry) – see AI opinions for alternatives")
+            elif actual_rr < min_rr:
+                st.warning(f"Reward:risk too low ({actual_rr:.2f}:1) – see AI opinions for alternatives or skip")
+            elif cash_risk < 20:
+                st.warning("Calculated risk too small for minimum lot size – see AI opinions for alternatives or skip")
+            else:
+                # Setup is valid — show it
+                st.divider()
+                st.markdown(f"### {action_header}")
+                with st.container(border=True):
+                    st.metric("Entry", f"${entry:.2f}")
+                    col_sl, col_tp = st.columns(2)
+                    col_sl.metric("Stop Loss", f"${sl:.2f}")
+                    col_tp.metric("Take Profit", f"${tp:.2f}")
+                    col_lots, col_risk = st.columns(2)
+                    col_lots.metric("Lots", f"{lots:.2f}")
+                    col_risk.metric("Risk Amount", f"${actual_risk:.2f}")
+                    col_rr = st.columns(1)[0]
+                    col_rr.metric("Actual R:R", f"1:{actual_rr:.2f}")
+
+            # Levels (always show)
             with st.expander("Detected Fractal Levels"):
                 st.write("**Resistance above:**", resistances[:3] or "None nearby")
                 st.write("**Support below:**", supports[:3] or "None nearby")
 
-            # Accept button (placeholder)
-            if st.button("✅ Accept This Setup"):
-                st.success("Setup accepted! (Notification pause logic can be added in PWA version)")
-
-            # Save to history
+            # Save (even rejected setups for history)
             st.session_state.saved_setups.append({
                 "time": datetime.utcnow().strftime("%H:%M UTC"),
                 "mode": st.session_state.mode,
@@ -311,7 +284,8 @@ else:
                 "tp": round(tp, 2),
                 "lots": lots,
                 "risk": actual_risk,
-                "rr": actual_rr
+                "rr": actual_rr,
+                "status": "Rejected by filters" if not valid_direction or actual_rr < min_rr else "Valid"
             })
 
         except Exception as e:
