@@ -481,4 +481,95 @@ else:
             col1.metric("Entry", f"${p.get('entry', 0):.2f}")
             col2.metric("SL / TP", f"${p.get('sl', 0):.2f} → ${p.get('tp', 0):.2f}")
             st.metric("Proposed Lots", f"{p.get('lots', 0.01):.2f}", f"Risk ~${p.get('risk', 0):.0f}")
-            st.caption(f"R:R ~1:{p.get(
+            st.caption(f"R:R ~1:{p.get('rr', '?.1f')}")
+            if p.get("event_warning"):
+                st.warning(p["event_warning"])
+
+    utc_now = datetime.now(timezone.utc)
+    if utc_now.hour >= 21 and utc_now.hour < 23:
+        st.warning("Late NY session — whipsaw risk ↑")
+
+    with st.spinner("Fetching data, calendar & auditing..."):
+        try:
+            live_price = get_current_price()
+            ts_15m = fetch_15m_data()
+            if ts_15m.empty:
+                raise ValueError("15m data empty")
+
+            latest_15m = ts_15m.iloc[-1]
+            rsi = latest_15m.get('rsi', 50.0)
+            atr = latest_15m.get('atr', 10.0)
+
+            ts_1h = fetch_htf_data("1h")
+            ts_5m = fetch_htf_data("5min")
+
+            ema200_15m = latest_15m.get('ema_200', live_price)
+            ema200_1h = ts_1h.iloc[-1].get('ema_200', live_price) if not ts_1h.empty else live_price
+            ema200_5m = ts_5m.iloc[-1].get('ema_200', live_price) if not ts_5m.empty else live_price
+
+            aligned_1h = (live_price > ema200_15m) == (live_price > ema200_1h)
+            aligned_5m = (live_price > ema200_15m) == (live_price > ema200_5m)
+
+            market = {"price": live_price, "rsi": rsi}
+            levels = get_fractal_levels(ts_15m)
+            buffer = st.session_state.balance - st.session_state.floor
+
+            setup = {"entry": live_price, "sl_distance": atr*1.5, "atr": atr, "risk_pct": st.session_state.risk_pct}
+
+            g_raw, k_raw, c_raw = get_ai_advice(market, setup, levels, buffer, aligned_1h, aligned_5m)
+
+            g_p = parse_ai_output(g_raw)
+            k_p = parse_ai_output(k_raw)
+            c_p = parse_ai_output(c_raw)
+
+            st.divider()
+            st.subheader("AI Audit")
+            cols = st.columns(3)
+            cols[0].markdown("**Gemini**"); cols[0].json(g_raw)
+            cols[1].markdown("**Grok**"); cols[1].json(k_raw)
+            cols[2].markdown("**ChatGPT**"); cols[2].json(c_raw)
+
+            high_count = sum(1 for p in [g_p, k_p, c_p] if p["verdict"] in ["ELITE", "HIGH_CONV"])
+
+            warning_text, _ = get_relevant_event_warning()
+
+            if high_count >= MIN_CONVICTION_FOR_ALERT:
+                p = g_p
+                entry = p.get("entry") or live_price
+                proposed_sl = p.get("sl")
+                sl_dist = abs(entry - proposed_sl) if proposed_sl else atr * 1.5
+                sl_dist = min(sl_dist, atr * MAX_SL_ATR_MULT)
+                sl = entry - sl_dist if "BULL" in p.get("direction", "") else entry + sl_dist
+                tp = p.get("tp") or (entry + atr*3 if "BULL" in p.get("direction", "") else entry - atr*3)
+
+                invalidated = check_opposing_invalidation(levels, p.get("direction", ""), entry, atr)
+                if invalidated:
+                    high_count -= 1
+
+                cash_risk = min(buffer * (st.session_state.risk_pct / 100), st.session_state.daily_limit or buffer)
+                risk_dist = abs(entry - sl) + SPREAD_BUFFER_POINTS + SLIPPAGE_BUFFER_POINTS
+                risk_per_lot = risk_dist * PIP_VALUE
+                lots = cash_risk / risk_per_lot if risk_per_lot > 0 else 0.01
+                lots = max(0.01, round(lots / 0.01) * 0.01)
+                actual_risk = lots * risk_per_lot
+
+                st.metric("Proposed Lots (strongest proposal, SL capped)", f"{lots:.2f}", f"Risk ~${actual_risk:.0f}")
+
+                if warning_text:
+                    st.warning(warning_text)
+
+            if high_count == 3:
+                st.success("3/3 Elite")
+            elif high_count == 2:
+                st.info("2/3 Conviction")
+            elif sum(1 for p in [g_p, k_p, c_p] if p["verdict"] == "SKIP") >= 2:
+                st.warning("Majority SKIP")
+            else:
+                st.markdown("Mixed – review carefully")
+
+        except Exception as e:
+            st.error(f"Analysis failed: {str(e)}\nLikely data/API issue – retry or wait.")
+
+    if st.button("Reset"):
+        st.session_state.analysis_done = False
+        st.rerun()
