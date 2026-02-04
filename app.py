@@ -17,7 +17,7 @@ import os
 SPREAD_BUFFER_POINTS = 0.30
 SLIPPAGE_BUFFER_POINTS = 0.20
 COMMISSION_PER_LOT_RT = 1.00
-PIP_VALUE = 100
+PIP_VALUE = 100                  # $ per 1.00 move per standard lot
 
 ALERT_COOLDOWN_MIN = 30
 MIN_CONVICTION_FOR_ALERT = 2
@@ -27,7 +27,7 @@ DEFAULT_DAILY_LIMIT = 250.0
 DEFAULT_FLOOR = 4500.0
 DEFAULT_RISK_PCT = 25
 
-LAST_ALERT_FILE = "last_alert.json"  # simple persistence for background
+LAST_ALERT_FILE = "last_alert.json"
 
 # ─── RETRY HELPER ────────────────────────────────────────────────────────────
 def retry_api(max_attempts=3, backoff=5):
@@ -143,7 +143,6 @@ Respond ONLY with valid JSON:
 }}
 """
 
-    # Slightly tuned variants
     try:
         g_out = gemini_model.generate_content(base_prompt).text.strip()
     except:
@@ -173,10 +172,11 @@ Respond ONLY with valid JSON:
 
     return g_out, k_out, c_out
 
-# ─── PARSE AI OUTPUT (JSON-first + fallback) ────────────────────────────────
+# ─── PARSE AI OUTPUT ─────────────────────────────────────────────────────────
 def parse_ai_output(text):
     try:
-        data = json.loads(text.strip('```json\n').strip('```'))
+        cleaned = text.strip('```json\n').strip('```').strip()
+        data = json.loads(cleaned)
         return {
             "verdict": data.get("verdict", "UNKNOWN").upper(),
             "reason": data.get("reason", ""),
@@ -188,32 +188,28 @@ def parse_ai_output(text):
             "direction": data.get("direction", "NEUTRAL").upper(),
             "proposal": "PROPOSAL" if data.get("entry") else "NONE"
         }
-    except json.JSONDecodeError:
-        # fallback regex (for rare failures)
-        data = {"verdict": "UNKNOWN", "reason": "", "proposal": "NONE"}
-        v = re.search(r'"verdict":\s*"(\w+)"', text, re.I)
-        if v: data["verdict"] = v.group(1).upper()
-        # ... similar for others if needed
-        return data
+    except:
+        # Fallback - rare cases
+        return {"verdict": "UNKNOWN", "reason": "Parsing failed", "proposal": "NONE"}
 
-# ─── LOAD/SAVE LAST ALERT ────────────────────────────────────────────────────
+# ─── LAST ALERT PERSISTENCE ──────────────────────────────────────────────────
 def load_last_alert():
     if os.path.exists(LAST_ALERT_FILE):
         try:
             with open(LAST_ALERT_FILE, "r") as f:
                 return json.load(f)
         except:
-            return {"time": 0, "key": None}
-    return {"time": 0, "key": None}
+            return {"time": 0, "key": None, "proposal": {}}
+    return {"time": 0, "key": None, "proposal": {}}
 
-def save_last_alert(time_val, key):
+def save_last_alert(time_val, key, proposal):
     try:
         with open(LAST_ALERT_FILE, "w") as f:
-            json.dump({"time": time_val, "key": key}, f)
+            json.dump({"time": time_val, "key": key, "proposal": proposal}, f)
     except:
         pass
 
-# ─── ALERT CHECK ─────────────────────────────────────────────────────────────
+# ─── ALERT CHECK (with lot sizing) ───────────────────────────────────────────
 def check_for_high_conviction_setup():
     last = load_last_alert()
     now = time.time()
@@ -235,6 +231,16 @@ def check_for_high_conviction_setup():
         levels = get_fractal_levels(ts_15m)
         buffer = DEFAULT_BALANCE - DEFAULT_FLOOR
 
+        # Try to use real session values
+        try:
+            balance = st.session_state.get("balance", DEFAULT_BALANCE)
+            floor = st.session_state.get("floor", DEFAULT_FLOOR)
+            daily_limit = st.session_state.get("daily_limit", None)
+            risk_pct = st.session_state.get("risk_pct", DEFAULT_RISK_PCT)
+            buffer = balance - floor
+        except:
+            pass
+
         ts_1h = fetch_htf_data("1h")
         ts_5m = fetch_htf_data("5min")
 
@@ -253,13 +259,21 @@ def check_for_high_conviction_setup():
         high_count = sum(1 for p in [g_p, k_p, c_p] if p["verdict"] in ["ELITE", "HIGH_CONV"])
 
         if high_count >= MIN_CONVICTION_FOR_ALERT:
-            p = g_p  # use Gemini as primary for alert
+            p = g_p  # Gemini primary for alert
             direction = p.get("direction", "UNKNOWN")
             style = p.get("style", "NONE")
             entry = p.get("entry") or live_price
             sl = p.get("sl") or (entry - atr*1.5 if "BULL" in direction else entry + atr*1.5)
             tp = p.get("tp") or (entry + atr*3 if "BULL" in direction else entry - atr*3)
             rr = p.get("rr") or 2.0
+
+            # Lot sizing
+            cash_risk = min(buffer * (risk_pct / 100), daily_limit or buffer)
+            risk_dist = abs(entry - sl) + SPREAD_BUFFER_POINTS + SLIPPAGE_BUFFER_POINTS
+            risk_per_lot = risk_dist * PIP_VALUE
+            lots = cash_risk / risk_per_lot if risk_per_lot > 0 else 0.01
+            lots = max(0.01, round(lots / 0.01) * 0.01)
+            actual_risk = lots * risk_per_lot
 
             key = f"{style}_{direction}_{entry:.2f}_{sl:.2f}"
             if key == last["key"]:
@@ -269,12 +283,25 @@ def check_for_high_conviction_setup():
                 f"**High Conviction Setup!** ({high_count}/3)\n"
                 f"Style: {style}\nDirection: {direction}\n"
                 f"Entry: ${entry:.2f}\nSL: ${sl:.2f}\nTP: ${tp:.2f} (R:R ~1:{rr:.1f})\n"
+                f"**Proposed lots: {lots:.2f}** (risk ~${actual_risk:.0f})\n"
                 f"Price: ${live_price:.2f} | RSI {rsi:.1f}"
             )
             priority = "high" if high_count == 3 else "normal"
             send_telegram(msg, priority)
 
-            save_last_alert(now, key)
+            # Save for dashboard display
+            proposal_data = {
+                "time": datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC'),
+                "style": style,
+                "direction": direction,
+                "entry": entry,
+                "sl": sl,
+                "tp": tp,
+                "rr": rr,
+                "lots": lots,
+                "risk": actual_risk
+            }
+            save_last_alert(now, key, proposal_data)
 
     except Exception as e:
         st.error(f"Background alert failed: {str(e)}")
@@ -330,7 +357,21 @@ else:
     cols[2].metric("Floor", f"${st.session_state.floor:.2f}")
     cols[3].metric("Risk %", f"{st.session_state.risk_pct}%")
 
-    if datetime.now(timezone.utc).hour >= 21 and datetime.now(timezone.utc).hour < 23:
+    # Last Alert Summary Card
+    last = load_last_alert()
+    if last.get("proposal"):
+        p = last["proposal"]
+        with st.expander("**Last High-Conviction Alert**", expanded=True):
+            st.markdown(f"**Time:** {p.get('time', 'unknown')}")
+            st.markdown(f"**Style:** {p.get('style')} | **Direction:** {p.get('direction')}")
+            col1, col2 = st.columns(2)
+            col1.metric("Entry", f"${p.get('entry', 0):.2f}")
+            col2.metric("SL / TP", f"${p.get('sl', 0):.2f} → ${p.get('tp', 0):.2f}")
+            st.metric("Proposed Lots", f"{p.get('lots', 0.01):.2f}", f"Risk ~${p.get('risk', 0):.0f}")
+            st.caption(f"R:R ~1:{p.get('rr', '?.1f')}")
+
+    utc_now = datetime.now(timezone.utc)
+    if utc_now.hour >= 21 and utc_now.hour < 23:
         st.warning("Late NY session — whipsaw risk ↑")
 
     with st.spinner("Fetching data & auditing..."):
@@ -375,6 +416,20 @@ else:
 
             high_count = sum(1 for p in [g_p, k_p, c_p] if p["verdict"] in ["ELITE", "HIGH_CONV"])
 
+            # Lot sizing for UI display (using strongest proposal - Gemini)
+            if high_count >= MIN_CONVICTION_FOR_ALERT:
+                p = g_p
+                entry = p.get("entry") or live_price
+                sl = p.get("sl") or (entry - atr*1.5 if "BULL" in p.get("direction", "") else entry + atr*1.5)
+                cash_risk = min(buffer * (st.session_state.risk_pct / 100), st.session_state.daily_limit or buffer)
+                risk_dist = abs(entry - sl) + SPREAD_BUFFER_POINTS + SLIPPAGE_BUFFER_POINTS
+                risk_per_lot = risk_dist * PIP_VALUE
+                lots = cash_risk / risk_per_lot if risk_per_lot > 0 else 0.01
+                lots = max(0.01, round(lots / 0.01) * 0.01)
+                actual_risk = lots * risk_per_lot
+
+                st.metric("Proposed Lots (strongest AI proposal)", f"{lots:.2f}", f"Risk ~${actual_risk:.0f}")
+
             if high_count == 3:
                 st.success("3/3 Elite")
             elif high_count == 2:
@@ -383,11 +438,6 @@ else:
                 st.warning("Majority SKIP")
             else:
                 st.markdown("Mixed – review carefully")
-
-            # Original logic remains as secondary check (optional)
-            st.divider()
-            st.subheader("Computed Setup (secondary)")
-            # ... (keep your original bias / entry / SL / TP logic here if desired)
 
         except Exception as e:
             st.error(f"Analysis failed: {str(e)}\nLikely data/API issue – retry or wait for reset.")
