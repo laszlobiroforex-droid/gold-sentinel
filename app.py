@@ -52,6 +52,9 @@ def get_ai_advice(market, setup, levels, buffer, mode):
     Original setup: {setup['type']} at ${setup['entry']:.2f} risking ${setup['risk']:.2f}
     Fractals: {levels_str}
 
+    Be strictly consistent: If you judge the original setup as low-edge / obsolete / gamble, your proposal MUST NOT simply re-use or slightly adjust the original entry price — that would contradict your verdict.
+    Only propose changes that meaningfully improve the setup (e.g. wait for pullback, different level, opposite bias, or skip entirely).
+
     First, give a blunt verdict on the original setup (elite or low-edge gamble? 2 sentences max).
 
     Then, if you see a meaningfully better or safer alternative (different entry, SL, TP, RR, lots, or even opposite bias), propose it clearly.
@@ -168,6 +171,7 @@ else:
                 "outputsize": 100
             }).with_rsi(**{}).with_ema(**{"time_period": 200}).with_ema(**{"time_period": 50}).with_atr(**{"time_period": 14}).as_pandas()
 
+            # Higher or lower timeframe
             if st.session_state.mode.startswith("Standard"):
                 ts_htf = td.time_series(**{
                     "symbol": "XAU/USD",
