@@ -36,35 +36,40 @@ def get_fractal_levels(df, window=5):
 # ─── TRIPLE AUDITORS ─────────────────────────────────────────────────────────
 def get_ai_advice(market, setup, levels, buffer, mode):
     levels_str = ", ".join([f"{l[0]}@{l[1]}" for l in levels[-5:]]) if levels else "No clear levels"
+    current_price = market['price']
     prompt = f"""
-    You are a high-conviction gold trading auditor for any account size.
-    Mode: {mode} ({'standard swing (15m + 1h)' if mode == 'Standard' else 'fast scalp (15m + 5m)'}).
-    Aggressive risk is user's choice — do NOT suggest reducing % risk.
-    Focus on math, pullback quality, structural confluence, risk/reward.
-    IMPORTANT: For buys, SL must be BELOW entry. For sells, SL must be ABOVE entry.
+You are a high-conviction gold trading auditor for any account size.
+Mode: {mode} ({'standard swing (15m + 1h)' if mode == 'Standard' else 'fast scalp (15m + 5m)'}).
+Aggressive risk is user's choice — do NOT suggest reducing % risk.
+Focus on math, pullback quality, structural confluence, risk/reward.
+IMPORTANT: For buys, SL must be BELOW entry. For sells, SL must be ABOVE entry.
 
-    Current UTC time: {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}
-    NY session close ~22:00 UTC — factor in thinning liquidity and whipsaw risk after 21:30 UTC.
-    If any high-impact news likely within ±30 min, prefer to wait unless setup is exceptionally strong.
+Current UTC time: {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}
+NY session close ~22:00 UTC — factor in thinning liquidity and whipsaw risk after 21:30 UTC.
+If any high-impact news likely within ±30 min, prefer to wait unless setup is exceptionally strong.
 
-    Buffer left: ${buffer:.2f}
-    Market: Price ${market['price']:.2f}, RSI {market['rsi']:.1f}
-    Original setup: {setup['type']} at ${setup['entry']:.2f} risking ${setup['risk']:.2f}
-    Fractals: {levels_str}
+Current market price: ${current_price:.2f}
+Buffer left: ${buffer:.2f}
+Market: Price ${current_price:.2f}, RSI {market['rsi']:.1f}
+Original setup: {setup['type']} at ${setup['entry']:.2f} risking ${setup['risk']:.2f}
+Fractals: {levels_str}
 
-    Be strictly consistent: If you judge the original setup as low-edge / obsolete / gamble, your proposal MUST NOT simply re-use or slightly adjust the original entry price — that would contradict your verdict.
-    Only propose changes that meaningfully improve the setup (e.g. wait for pullback, different level, opposite bias, or skip entirely).
+Be STRICTLY consistent:
+- If you judge the original setup as low-edge, obsolete, missed, gamble, or chasing, your proposal MUST NOT suggest waiting for a deeper pullback to the original level or lower — that would contradict your verdict.
+- Any proposal MUST respect current market price ${current_price:.2f} — never suggest entries significantly below current price in bullish mode or above in bearish mode unless clear reversal evidence exists.
+- Only propose changes that meaningfully improve the setup (e.g. higher entry in trend continuation, opposite bias, different SL/TP, or skip entirely).
+- If no good alternative exists, clearly recommend skipping.
 
-    First, give a blunt verdict on the original setup (elite or low-edge gamble? 2 sentences max).
+First, give a blunt verdict on the original setup (elite or low-edge gamble? 2 sentences max).
 
-    Then, if you see a meaningfully better or safer alternative (different entry, SL, TP, RR, lots, or even opposite bias), propose it clearly.
-    Format your proposal like this:
-    PROPOSAL: [brief description, e.g. "Move entry to $X, SL to $Y for 2.5:1 RR"]
-    REASONING: [1-2 sentences why it's better]
+Then, if you see a meaningfully better or safer alternative, propose it clearly.
+Format your proposal like this:
+PROPOSAL: [brief description, e.g. "Move entry to $X, SL to $Y for 2.5:1 RR"]
+REASONING: [1-2 sentences why it's better]
 
-    If no meaningful change is needed, just say "No better alternative".
-    Keep total response under 5 sentences.
-    """
+If no meaningful change is needed or no good trade exists, just say "No better alternative — skip or wait".
+Keep total response under 5 sentences.
+"""
 
     # Gemini
     try:
@@ -89,7 +94,7 @@ def get_ai_advice(market, setup, levels, buffer, mode):
             model="gpt-4o-mini",
             messages=[{"role": "user", "content": prompt}],
             max_tokens=220,
-            temperature=0.7
+            temperature=0.65  # slightly lower for more consistency
         )
         c_out = response.choices[0].message.content.strip()
     except Exception as e:
@@ -171,7 +176,6 @@ else:
                 "outputsize": 100
             }).with_rsi(**{}).with_ema(**{"time_period": 200}).with_ema(**{"time_period": 50}).with_atr(**{"time_period": 14}).as_pandas()
 
-            # Higher or lower timeframe
             if st.session_state.mode.startswith("Standard"):
                 ts_htf = td.time_series(**{
                     "symbol": "XAU/USD",
@@ -282,10 +286,12 @@ else:
             elite_count = sum(1 for v in verdicts if "elite" in v)
             gamble_count = sum(1 for v in verdicts if "gamble" in v or "low-edge" in v)
 
-            if elite_count >= 2:
-                st.success(f"Strong consensus ({elite_count}/3 elite) — high-conviction setup likely")
+            if elite_count == 3:
+                st.success("Strong consensus (3/3 elite) — very high conviction")
+            elif elite_count == 2:
+                st.info("Moderate consensus (2/3 elite) — reasonable conviction")
             elif gamble_count >= 2:
-                st.warning(f"Caution consensus ({gamble_count}/3 gamble/low-edge) — review carefully")
+                st.warning(f"Caution consensus ({gamble_count}/3 gamble/low-edge) — review very carefully")
             else:
                 st.info(f"Mixed opinions — {proposals} AI(s) proposed changes. Review all three.")
 
