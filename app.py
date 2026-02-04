@@ -220,16 +220,21 @@ else:
                 
                 tp = supports[0] if supports else entry - (sl_dist * 2.5)
 
-            # Temporary risk calc for AI (may be invalid direction)
-            temp_sl_dist = abs(entry - sl)
-            temp_lots = max(round(cash_risk / ((temp_sl_dist + 0.35) * 100), 2), 0.01)
-            temp_risk = round(temp_lots * (temp_sl_dist + 0.35) * 100, 2)
+            # ─── RISK CALC EARLY (FIXED SCOPE) ───────────────────────────────────
+            buffer = st.session_state.balance - st.session_state.floor
+            cash_risk = min(buffer * (st.session_state.risk_pct / 100), st.session_state.daily_limit or buffer)
 
-            # ─── AI OPINIONS FIRST (always show) ─────────────────────────────────
+            # ─── DYNAMIC MIN RISK ────────────────────────────────────────────────
+            min_risk_vol = atr * 100 * 0.01 * 2       # 2×ATR worth of 0.01 lot
+            min_risk_pct = buffer * 0.005             # 0.5% of buffer
+            min_risk_hard = 10                        # absolute floor
+            min_risk_overall = max(min_risk_vol, min_risk_pct, min_risk_hard)
+
+            # ─── AI OPINIONS FIRST (always run) ──────────────────────────────────
             st.divider()
             st.subheader("AI Opinions")
             market = {"price": live_price, "rsi": rsi}
-            setup = {"type": bias, "entry": entry, "risk": temp_risk}
+            setup = {"type": bias, "entry": entry, "risk": cash_risk}
             g_verdict, k_verdict = get_ai_advice(market, setup, levels, buffer, st.session_state.mode)
 
             col_g, col_k = st.columns(2)
@@ -242,20 +247,24 @@ else:
 
             st.caption("AI opinions are probabilistic assessments, not trading signals.")
 
-            # ─── NOW APPLY HARD FILTERS ──────────────────────────────────────────
+            # ─── APPLY HARD FILTERS AFTER AI ─────────────────────────────────────
             valid_direction = (bias == "BULLISH" and sl < entry) or (bias == "BEARISH" and sl > entry)
             risk_dist = abs(entry - sl)
             reward_dist = abs(tp - entry)
             actual_rr = reward_dist / risk_dist if risk_dist > 0 else 0.0
 
-            if not valid_direction:
+            if cash_risk < min_risk_overall:
+                st.warning(f"Risk too small (\( {cash_risk:.2f}) vs dynamic min ( \){min_risk_overall:.2f} – volatility & buffer adjusted) – see AI opinions for alternatives or skip")
+            elif not valid_direction:
                 st.error("Invalid risk direction (SL on wrong side of entry) – see AI opinions for alternatives")
             elif actual_rr < min_rr:
                 st.warning(f"Reward:risk too low ({actual_rr:.2f}:1) – see AI opinions for alternatives or skip")
-            elif cash_risk < 20:
-                st.warning("Calculated risk too small for minimum lot size – see AI opinions for alternatives or skip")
             else:
-                # Setup is valid — show it
+                # Valid — show setup
+                sl_dist_actual = risk_dist
+                lots = max(round(cash_risk / ((sl_dist_actual + 0.35) * 100), 2), 0.01)
+                actual_risk = round(lots * (sl_dist_actual + 0.35) * 100, 2)
+
                 st.divider()
                 st.markdown(f"### {action_header}")
                 with st.container(border=True):
@@ -274,7 +283,11 @@ else:
                 st.write("**Resistance above:**", resistances[:3] or "None nearby")
                 st.write("**Support below:**", supports[:3] or "None nearby")
 
-            # Save (even rejected setups for history)
+            # Accept button (placeholder)
+            if st.button("✅ Accept This Setup"):
+                st.success("Setup accepted! (Notification pause logic can be added in PWA version)")
+
+            # Save to history
             st.session_state.saved_setups.append({
                 "time": datetime.utcnow().strftime("%H:%M UTC"),
                 "mode": st.session_state.mode,
@@ -283,9 +296,9 @@ else:
                 "sl": round(sl, 2),
                 "tp": round(tp, 2),
                 "lots": lots,
-                "risk": actual_risk,
+                "risk": cash_risk,
                 "rr": actual_rr,
-                "status": "Rejected by filters" if not valid_direction or actual_rr < min_rr else "Valid"
+                "status": "Rejected by filters" if cash_risk < min_risk_overall or not valid_direction or actual_rr < min_rr else "Valid"
             })
 
         except Exception as e:
