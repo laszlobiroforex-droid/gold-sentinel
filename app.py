@@ -281,36 +281,36 @@ else:
 
             st.caption("AI opinions are probabilistic assessments, not trading signals.")
 
-            # ─── CONSENSUS SUMMARY ───────────────────────────────────────────────
+            # ─── CONSENSUS SUMMARY WITH COLOUR SWAP ──────────────────────────────
             verdicts = [g_verdict.lower(), k_verdict.lower(), c_verdict.lower()]
-            proposals = [v for v in [g_verdict, k_verdict, c_verdict] if "PROPOSAL:" in v]
-            elite_count = sum(1 for v in verdicts if "elite" in v)
+            elite_count = sum(1 for v in verdicts if "elite" in v or "high-conviction" in v)
             gamble_count = sum(1 for v in verdicts if "gamble" in v or "low-edge" in v)
+            skip_count = sum(1 for v in verdicts if "skip" in v or "wait" in v or "no better alternative" in v)
 
-            # Main consensus badge
             if elite_count == 3:
                 st.success("3/3 High Conviction – Strongest signal")
             elif elite_count == 2:
                 st.info("2/3 High Conviction – Reasonable confidence")
-            elif gamble_count >= 2:
-                st.warning(f"{gamble_count}/3 Gamble/Low-edge – Caution advised")
+            elif skip_count == 3:
+                st.error("3/3 Skip – No high-conviction trade right now")
+            elif skip_count == 2:
+                st.warning("2/3 Skip – Caution, one AI sees alternative")
             else:
-                st.info("Mixed opinions – Review all three carefully")
+                st.markdown(
+                    "<div style='padding:10px; background-color:#555; color:white; border-radius:5px;'>"
+                    "Mixed / low consensus – Review carefully or skip"
+                    "</div>",
+                    unsafe_allow_html=True
+                )
 
             # ─── PROPOSALS BOX (only if 2+ similar proposals) ────────────────────
+            proposals = [v for v in [g_verdict, k_verdict, c_verdict] if "PROPOSAL:" in v]
             if len(proposals) >= 2:
-                # Simple extraction of proposed entry/SL/TP (regex, crude but good enough)
                 entries = []
-                sls = []
-                tps = []
                 for p in proposals:
                     entry_match = re.search(r"entry to \$?([\d\.]+)", p, re.IGNORECASE)
-                    sl_match = re.search(r"SL to \$?([\d\.]+)", p, re.IGNORECASE)
-                    tp_match = re.search(r"target(?:ing)? .*\$?([\d\.]+)", p, re.IGNORECASE)
-                    
-                    if entry_match: entries.append(float(entry_match.group(1)))
-                    if sl_match: sls.append(float(sl_match.group(1)))
-                    if tp_match: tps.append(float(tp_match.group(1)))
+                    if entry_match:
+                        entries.append(float(entry_match.group(1)))
 
                 if len(entries) >= 2:
                     avg_entry = np.mean(entries)
@@ -319,14 +319,6 @@ else:
                     st.markdown(f"<div style='padding:10px; background-color:{color}; color:white; border-radius:5px;'>"
                                 f"Proposal consensus ({len(entries)}/{len(proposals)}): Buy/Sell near ${avg_entry:.2f} "
                                 f"(spread ${entry_spread:.2f})</div>", unsafe_allow_html=True)
-
-                if len(sls) >= 2:
-                    avg_sl = np.mean(sls)
-                    st.markdown(f"<div style='padding:8px; background-color:#444; color:white;'>Avg proposed SL: ${avg_sl:.2f}</div>", unsafe_allow_html=True)
-
-                if len(tps) >= 2:
-                    avg_tp = np.mean(tps)
-                    st.markdown(f"<div style='padding:8px; background-color:#444; color:white;'>Avg proposed TP: ${avg_tp:.2f}</div>", unsafe_allow_html=True)
 
             # ─── APPLY HARD FILTERS AFTER AI ─────────────────────────────────────
             valid_direction = (bias == "BULLISH" and sl < entry) or (bias == "BEARISH" and sl > entry)
