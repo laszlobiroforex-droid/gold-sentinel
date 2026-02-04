@@ -27,7 +27,6 @@ DEFAULT_BALANCE = 5000.0
 DEFAULT_DAILY_LIMIT = 250.0
 DEFAULT_FLOOR = 4500.0
 DEFAULT_RISK_PCT = 25
-DEFAULT_MODE = "Standard (Swing – 15m + 1h alignment)"
 
 # ─── RETRY HELPER ────────────────────────────────────────────────────────────
 def retry_api(max_attempts=3, backoff=5):
@@ -93,16 +92,16 @@ def get_fractal_levels(df, window=5, min_dist_factor=0.4):
                 levels.append(('SUP', price))
     return sorted(levels, key=lambda x: x[1], reverse=True)
 
-# ─── FIXED DATA FETCH ────────────────────────────────────────────────────────
+# ─── DATA FETCH (reduced sizes + both HTFs always) ───────────────────────────
 @st.cache_data(ttl=300)
 @retry_api()
 def fetch_15m_data():
     ts = td.time_series(
         symbol="XAU/USD",
         interval="15min",
-        outputsize=500
+        outputsize=200
     )
-    ts = ts.with_rsi()                     # default period=14
+    ts = ts.with_rsi()
     ts = ts.with_ema(time_period=200)
     ts = ts.with_ema(time_period=50)
     ts = ts.with_atr(time_period=14)
@@ -111,7 +110,7 @@ def fetch_15m_data():
 @st.cache_data(ttl=300)
 @retry_api()
 def fetch_htf_data(interval):
-    out_size = 500 if interval == "5min" else 200
+    out_size = 200 if interval == "5min" else 100
     ts = td.time_series(
         symbol="XAU/USD",
         interval=interval,
@@ -125,40 +124,31 @@ def fetch_htf_data(interval):
 def get_current_price():
     return float(td.price(symbol="XAU/USD").as_json()["price"])
 
-# ─── AI ADVICE ───────────────────────────────────────────────────────────────
+# ─── AI ADVICE (no mode, richer context) ─────────────────────────────────────
 @retry_api()
-def get_ai_advice(market, setup, levels, buffer, mode):
+def get_ai_advice(market, setup, levels, buffer, aligned_1h, aligned_5m):
     levels_str = ", ".join([f"{l[0]}@{l[1]}" for l in levels[:6]]) if levels else "No clear levels"
     current_price = market['price']
     prompt = f"""
-You are a high-conviction gold trading auditor for any account size.
-Mode: {mode} ({'standard swing (15m + 1h)' if mode == 'Standard' else 'fast scalp (15m + 5m)'}).
-Aggressive risk is user's choice — size is handled externally, do NOT suggest lots multiplier or position size changes.
-Focus on math, pullback quality, structural confluence, risk/reward.
-IMPORTANT: For buys, SL must be BELOW entry. For sells, SL must be ABOVE entry.
+You are a high-conviction gold trading auditor.
+Evaluate ANY high-edge pattern visible in current data: continuation pullbacks (scalp or swing), momentum breakouts, reversals at structure, range-bound mean-reversion, etc.
+Prioritize setups with:
+- RR ≥ 1.8
+- Multiple confluences (fractals, EMAs, RSI, session/time)
+- Clean risk (proper SL placement)
+Be brutal — skip if low quality, chasing, or gamble.
 
-Current UTC time: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}
-NY session close ~22:00 UTC — factor in thinning liquidity and whipsaw risk after 21:30 UTC.
-If any high-impact news likely within ±30 min, prefer to wait unless setup is exceptionally strong.
-
-Current market price: ${current_price:.2f}
-Buffer left: ${buffer:.2f}
-Market: Price ${current_price:.2f}, RSI {market['rsi']:.1f}
-Original setup: {setup['type']} at ${setup['entry']:.2f}, SL distance ${setup['sl_distance']:.2f}, ATR ${setup['atr']:.2f}, risk % {setup['risk_pct']:.0f}%
+Current UTC time: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')} (NY close ~22:00 UTC, watch whipsaw after 21:30)
+Market: ${current_price:.2f}, RSI {market['rsi']:.1f}
+Trend context: 15m vs 1H EMA200 alignment: {'agree' if aligned_1h else 'disagree'}, 15m vs 5M EMA200: {'agree' if aligned_5m else 'disagree'}
 Fractals: {levels_str}
+Original levels: entry ~${setup['entry']:.2f}, ATR ${setup['atr']:.2f}, risk buffer ${buffer:.2f}
 
-Be STRICTLY consistent:
-- If original setup is low-edge, obsolete, missed, gamble, or chasing, your proposal MUST NOT re-use or slightly adjust the original entry price.
-- Any proposal MUST respect current market price ${current_price:.2f} — never suggest entries significantly below current price in bullish mode or above in bearish mode unless clear reversal evidence exists.
-- Direction must match detected bias unless verdict explicitly states "reversal".
-- Only propose changes that meaningfully improve the setup (e.g. higher entry in continuation, different SL/TP, or skip).
-- If no good alternative exists, clearly recommend skipping.
-
-Respond ONLY in this exact structured format. Do not add extra text.
+Respond in exact format:
 
 VERDICT: ELITE | HIGH_CONV | LOW_EDGE | GAMBLE | SKIP
-REASON: [short explanation, 1-2 sentences]
-PROPOSAL: [entry price] | [SL price] | [TP price] | [RR ratio e.g. 2.5] | [direction: BULLISH/BEARISH/NEUTRAL] | [reasoning, 1-2 sentences]
+REASON: [1-2 sentences]
+PROPOSAL: [entry price] | [SL price] | [TP price] | [RR ratio e.g. 2.5] | [STYLE: SCALP/SWING/BREAKOUT/REVERSAL/RANGE/NONE] | [direction: BULLISH/BEARISH/NEUTRAL] | [reasoning, 1-2 sentences]
 or
 PROPOSAL: NONE
 """
@@ -191,12 +181,12 @@ PROPOSAL: NONE
 
     return g_out, k_out, c_out
 
-# ─── PARSE AI OUTPUT ─────────────────────────────────────────────────────────
+# ─── PARSE AI OUTPUT (with STYLE) ────────────────────────────────────────────
 def parse_ai_output(text):
     verdict = "UNKNOWN"
     reason = ""
     proposal = "NONE"
-    entry = sl = tp = rr = direction = None
+    entry = sl = tp = rr = direction = style = None
 
     v_match = re.search(r"VERDICT:\s*(\w+)", text, re.IGNORECASE)
     if v_match:
@@ -211,13 +201,15 @@ def parse_ai_output(text):
         proposal_raw = p_match.group(1).strip()
         if proposal_raw.upper() != "NONE":
             parts = [p.strip() for p in proposal_raw.split("|")]
-            if len(parts) >= 5:
+            if len(parts) >= 6:
                 try:
                     entry = float(parts[0])
                     sl = float(parts[1])
                     tp = float(parts[2])
                     rr = float(parts[3])
-                    direction = parts[4].strip().upper()
+                    style_match = re.search(r'STYLE:\s*(\w+)', parts[4], re.IGNORECASE)
+                    style = style_match.group(1).upper() if style_match else "UNKNOWN"
+                    direction = parts[5].strip().upper()
                     proposal = "PROPOSAL"
                 except:
                     pass
@@ -230,6 +222,7 @@ def parse_ai_output(text):
         "sl": sl,
         "tp": tp,
         "rr": rr,
+        "style": style,
         "direction": direction
     }
 
@@ -256,7 +249,17 @@ def check_for_high_conviction_setup():
         levels = get_fractal_levels(ts_15m)
         buffer = DEFAULT_BALANCE - DEFAULT_FLOOR
 
-        g_raw, k_raw, c_raw = get_ai_advice(market, setup, levels, buffer, DEFAULT_MODE)
+        # Both HTFs for richer context
+        ts_1h = fetch_htf_data("1h")
+        ts_5m = fetch_htf_data("5min")
+
+        ema200_1h = ts_1h.iloc[-1].get('ema_200', live_price) if not ts_1h.empty else live_price
+        ema200_5m = ts_5m.iloc[-1].get('ema_200', live_price) if not ts_5m.empty else live_price
+
+        aligned_1h = (live_price > ema200_1h) == (live_price > live_price)  # simplified agreement check
+        aligned_5m = (live_price > ema200_5m) == (live_price > live_price)
+
+        g_raw, k_raw, c_raw = get_ai_advice(market, setup, levels, buffer, aligned_1h, aligned_5m)
         g_p = parse_ai_output(g_raw)
         k_p = parse_ai_output(k_raw)
         c_p = parse_ai_output(c_raw)
@@ -265,17 +268,19 @@ def check_for_high_conviction_setup():
 
         if high_count >= MIN_CONVICTION_FOR_ALERT:
             direction = g_p.get("direction") or "UNKNOWN"
+            style = g_p.get("style") or "UNKNOWN"
             entry = g_p.get("entry") or live_price
             sl = g_p.get("sl") or (entry - atr*1.5 if direction.startswith("BULL") else entry + atr*1.5)
             tp = g_p.get("tp") or (entry + atr*3 if direction.startswith("BULL") else entry - atr*3)
             rr = g_p.get("rr") or 2.0
 
-            key = f"{direction}_{entry:.2f}_{sl:.2f}"
+            key = f"{style}_{direction}_{entry:.2f}_{sl:.2f}"
             if st.session_state.last_alerted_key == key:
                 return
 
             msg = (
                 f"**High Conviction Setup!** ({high_count}/3 AIs)\n"
+                f"Style: {style}\n"
                 f"Direction: {direction}\n"
                 f"Entry: ${entry:.2f}\n"
                 f"SL: ${sl:.2f}\n"
@@ -293,7 +298,7 @@ def check_for_high_conviction_setup():
 
 # ─── BACKGROUND THREAD ───────────────────────────────────────────────────────
 def run_background_checker():
-    schedule.every(5).minutes.do(check_for_high_conviction_setup)
+    schedule.every(15).minutes.do(check_for_high_conviction_setup)
     while True:
         schedule.run_pending()
         time.sleep(1)
@@ -306,7 +311,7 @@ if "checker_started" not in st.session_state:
 # ─── STREAMLIT UI ────────────────────────────────────────────────────────────
 st.set_page_config(page_title="Gold Sentinel Pro", page_icon="🥇", layout="wide")
 st.title("🥇 Gold Sentinel – High Conviction Gold Entries")
-st.caption(f"Adaptive pullback engine | {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
+st.caption(f"Adaptive pullback engine | Background checks every 15 min (free tier credit optimization) | {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
 
 # Session state defaults
 if "analysis_done" not in st.session_state:
@@ -315,7 +320,6 @@ if "analysis_done" not in st.session_state:
     st.session_state.daily_limit = DEFAULT_DAILY_LIMIT
     st.session_state.floor = DEFAULT_FLOOR
     st.session_state.risk_pct = DEFAULT_RISK_PCT
-    st.session_state.mode = DEFAULT_MODE
     st.session_state.last_analysis = 0
 
 # ─── INPUTS ──────────────────────────────────────────────────────────────────
@@ -341,12 +345,6 @@ if not st.session_state.analysis_done:
         "Risk % of Available Buffer", 5, 50, st.session_state.risk_pct, step=5
     )
 
-    st.session_state.mode = st.radio(
-        "Analysis Mode",
-        ["Standard (Swing – 15m + 1h alignment)", "Scalp (Fast – 15m + 5m alignment)"],
-        index=0 if st.session_state.mode.startswith("Standard") else 1
-    )
-
     if st.button("🚀 Analyze & Suggest", type="primary", use_container_width=True):
         if st.session_state.balance <= 0:
             st.error("Enter valid balance > 0")
@@ -364,26 +362,35 @@ else:
     cols[1].metric("Daily Limit", f"${st.session_state.daily_limit:.2f}" if st.session_state.daily_limit else "No limit")
     cols[2].metric("Floor", f"${st.session_state.floor:.2f}")
     cols[3].metric("Risk %", f"{st.session_state.risk_pct}%")
-    cols[4].metric("Mode", st.session_state.mode.split(" – ")[0])
 
     utc_now = datetime.now(timezone.utc)
     if utc_now.hour >= 21 and utc_now.hour < 23:
         st.warning("Late NY session — higher whipsaw risk after ~21:30 UTC")
 
-    with st.spinner("Running triple AI audit first..."):
+    with st.spinner("Fetching data & running triple AI audit (may take a moment)..."):
         try:
             live_price = get_current_price()
             ts_15m = fetch_15m_data()
-            latest_15m = ts_15m.iloc[-1]
-            rsi = latest_15m.get('rsi', 50.0)
-            atr = latest_15m.get('atr', 10.0) or 10.0
+            latest_15m = ts_15m.iloc[-1] if not ts_15m.empty else None
+            rsi = latest_15m.get('rsi', 50.0) if latest_15m is not None else 50.0
+            atr = latest_15m.get('atr', 10.0) if latest_15m is not None else 10.0
+
+            # Both HTFs
+            ts_1h = fetch_htf_data("1h")
+            ts_5m = fetch_htf_data("5min")
+
+            ema200_1h = ts_1h.iloc[-1].get('ema_200', live_price) if not ts_1h.empty else live_price
+            ema200_5m = ts_5m.iloc[-1].get('ema_200', live_price) if not ts_5m.empty else live_price
+
+            aligned_1h = (live_price > ema200_1h) == (live_price > (latest_15m.get('ema_200', live_price) if latest_15m is not None else live_price))
+            aligned_5m = (live_price > ema200_5m) == (live_price > (latest_15m.get('ema_200', live_price) if latest_15m is not None else live_price))
 
             market = {"price": live_price, "rsi": rsi}
-            levels = get_fractal_levels(ts_15m)
+            levels = get_fractal_levels(ts_15m) if not ts_15m.empty else []
             buffer = st.session_state.balance - st.session_state.floor
 
             setup_placeholder = {
-                "type": "PULLBACK",
+                "type": "UNKNOWN",
                 "entry": live_price,
                 "sl_distance": atr * 1.5,
                 "atr": atr,
@@ -391,7 +398,7 @@ else:
             }
 
             g_raw, k_raw, c_raw = get_ai_advice(
-                market, setup_placeholder, levels, buffer, st.session_state.mode
+                market, setup_placeholder, levels, buffer, aligned_1h, aligned_5m
             )
 
             g_parsed = parse_ai_output(g_raw)
@@ -426,24 +433,22 @@ else:
 
             # ── Your original logic (secondary) ─────────────────────────────────
             st.divider()
-            st.subheader("Your Structured Setup (secondary check)")
+            st.subheader("Structured Setup (secondary check)")
             try:
-                interval = "1h" if st.session_state.mode.startswith("Standard") else "5min"
-                ts_htf = fetch_htf_data(interval)
+                # Use 1h for continuation bias, but AIs already decided style
+                ts_htf = ts_1h if not ts_1h.empty else ts_5m
+                latest_htf = ts_htf.iloc[-1] if not ts_htf.empty else None
+                ema200_htf = latest_htf.get('ema_200', live_price) if latest_htf is not None else live_price
 
-                latest_htf = ts_htf.iloc[-1]
                 ema_cols_15m = sorted([c for c in ts_15m.columns if 'ema' in c.lower()])
-                ema200_15m = latest_15m[ema_cols_15m[0]] if ema_cols_15m else live_price
-                ema50_15m  = latest_15m[ema_cols_15m[1]] if len(ema_cols_15m) >= 2 else live_price
-
-                ema_cols_htf = [c for c in ts_htf.columns if 'ema' in c.lower()]
-                ema200_htf = latest_htf[sorted(ema_cols_htf)[0]] if ema_cols_htf else live_price
+                ema200_15m = latest_15m.get(ema_cols_15m[0], live_price) if ema_cols_15m and latest_15m is not None else live_price
+                ema50_15m  = latest_15m.get(ema_cols_15m[1], live_price) if len(ema_cols_15m) >= 2 and latest_15m is not None else live_price
 
                 aligned = (live_price > ema200_15m and live_price > ema200_htf) or \
                           (live_price < ema200_15m and live_price < ema200_htf)
 
                 if not aligned:
-                    st.warning("Trend misalignment between 15m and HTF EMA200 → no high-conviction continuation trade recommended")
+                    st.warning("Trend misalignment detected → no high-conviction continuation recommended")
                 else:
                     bias = "BULLISH" if live_price > ema200_15m else "BEARISH"
 
@@ -479,6 +484,7 @@ else:
                     if len(proposals) >= 2:
                         entries = [p["entry"] for p in proposals]
                         directions = [p["direction"] for p in proposals if p["direction"]]
+                        styles = [p["style"] for p in proposals if p["style"]]
                         if len(set(directions)) == 1 and max(entries) - min(entries) <= 10:
                             avg_entry = np.mean(entries)
                             avg_sl = np.mean([p["sl"] for p in proposals if p["sl"] is not None])
@@ -528,18 +534,18 @@ else:
                         if override_applied:
                             st.caption("Levels averaged from AI proposals")
                     else:
-                        st.warning("Your setup rejected:\n" + "\n".join(warnings))
+                        st.warning("Setup rejected:\n" + "\n".join(warnings))
 
                     with st.expander("Fractal Levels"):
                         st.write("Resistance above:", resistances[:4] or "None close")
                         st.write("Support below:", supports[:4] or "None close")
 
             except Exception as e:
-                st.error(f"Original setup calculation failed: {e}\n→ Rely on AI verdicts above")
+                st.error(f"Setup calculation failed: {e}\n→ Rely on AI verdicts above")
 
             if st.button("Reset & Re-analyze"):
                 st.session_state.analysis_done = False
                 st.rerun()
 
         except Exception as e:
-            st.error(f"Core data / AI fetch failed: {str(e)}\nTry again in a few minutes.")
+            st.error(f"Core data / AI fetch failed: {str(e)}\nLikely Twelve Data credit limit or timeout – wait for reset or reduce load. Try again in a few minutes.")
