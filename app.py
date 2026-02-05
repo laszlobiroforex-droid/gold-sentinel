@@ -34,7 +34,7 @@ def send_telegram(message, priority="normal"):
     except:
         st.error("Telegram send failed")
 
-# ─── CACHED DATA FETCH (only 3 calls) ──────────────────────────────────────
+# ─── CACHED DATA FETCH (only price + 15m + 1h) ─────────────────────────────
 @st.cache_data(ttl=60)
 def get_live_price():
     return float(td.price(symbol="XAU/USD").as_json()["price"])
@@ -185,14 +185,74 @@ Respond **ONLY** with valid JSON. No fences, no markdown, no extra text:
 
     high_count = sum(1 for p in [g_p, k_p, c_p] if p["verdict"] in ["ELITE", "HIGH_CONV"])
 
-    # Display
+    # ─── CLEAN DISPLAY ─────────────────────────────────────────────────────────
+    st.divider()
+    st.subheader("AI Verdicts")
+
+    def format_verdict(p, ai_name):
+        if p["verdict"] == "PARSE_ERROR":
+            return f"**{ai_name}** — Parse error: {p['reason']}"
+
+        verdict = p["verdict"]
+        reason = p["reason"]
+        direction = p["direction"]
+        style = p["style"]
+        entry = f"${p['entry']:.2f}" if p["entry"] is not None else "—"
+        sl = f"${p['sl']:.2f}" if p["sl"] is not None else "—"
+        tp = f"${p['tp']:.2f}" if p["tp"] is not None else "—"
+        rr = f"1:{p['rr']:.1f}" if p["rr"] is not None else "—"
+        reasoning = p["reasoning"]
+
+        colors = {
+            "ELITE": "#2ecc71",
+            "HIGH_CONV": "#3498db",
+            "LOW_EDGE": "#e67e22",
+            "GAMBLE": "#e74c3c",
+            "SKIP": "#95a5a6",
+            "PARSE_ERROR": "#7f8c8d",
+            "UNKNOWN": "#7f8c8d"
+        }
+        color = colors.get(verdict, "#7f8c8d")
+
+        return f"""
+        <div style="
+            background: {color}11;
+            border-left: 5px solid {color};
+            padding: 16px 20px;
+            margin: 16px 0;
+            border-radius: 8px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+        ">
+            <div style="font-size: 1.3em; font-weight: bold; color: {color}; margin-bottom: 8px;">
+                {ai_name} — {verdict}
+            </div>
+            <div style="margin-bottom: 12px; color: #555;">
+                {reason}
+            </div>
+            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin: 12px 0;">
+                <div><strong>Direction:</strong> {direction}</div>
+                <div><strong>Style:</strong> {style}</div>
+                <div><strong>Entry:</strong> {entry}</div>
+                <div><strong>SL:</strong> {sl}</div>
+                <div><strong>TP:</strong> {tp}</div>
+                <div><strong>RR:</strong> {rr}</div>
+            </div>
+            <div style="font-style: italic; color: #444; margin-top: 12px;">
+                {reasoning}
+            </div>
+        </div>
+        """
+
     col1, col2, col3 = st.columns(3)
-    col1.markdown("**Gemini**")
-    col1.json(g_p)
-    col2.markdown("**Grok**")
-    col2.json(k_p)
-    col3.markdown("**ChatGPT**")
-    col3.json(c_p)
+
+    with col1:
+        st.markdown(format_verdict(g_p, "Gemini"), unsafe_allow_html=True)
+
+    with col2:
+        st.markdown(format_verdict(k_p, "Grok"), unsafe_allow_html=True)
+
+    with col3:
+        st.markdown(format_verdict(c_p, "ChatGPT"), unsafe_allow_html=True)
 
     # Consensus & Telegram
     if high_count >= 2:
