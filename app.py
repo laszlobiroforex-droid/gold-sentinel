@@ -1,6 +1,5 @@
 import streamlit as st
 import json
-import time
 from datetime import datetime, timezone
 from twelvedata import TDClient
 import google.generativeai as genai
@@ -9,8 +8,7 @@ import requests
 import numpy as np
 
 # ─── CONFIG ────────────────────────────────────────────────────────────────
-# No defaults — all optional
-# Risk % is free-typed (0.1 step)
+# All account fields optional — no defaults
 
 # ─── API INIT ──────────────────────────────────────────────────────────────
 td = TDClient(apikey=st.secrets["TWELVE_DATA_KEY"])
@@ -25,7 +23,7 @@ def send_telegram(message, priority="normal"):
     token   = st.secrets.get("TELEGRAM_BOT_TOKEN")
     chat_id = st.secrets.get("TELEGRAM_CHAT_ID")
     if not token or not chat_id:
-        st.warning("Telegram not configured (add TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID to secrets)")
+        st.warning("Telegram not configured")
         return
 
     emoji = "🟢 ELITE" if priority == "high" else "🔵 Conviction"
@@ -36,7 +34,7 @@ def send_telegram(message, priority="normal"):
     except:
         st.error("Telegram send failed")
 
-# ─── CACHED DATA FETCH ─────────────────────────────────────────────────────
+# ─── CACHED DATA FETCH (only 3 calls) ──────────────────────────────────────
 @st.cache_data(ttl=60)
 def get_live_price():
     return float(td.price(symbol="XAU/USD").as_json()["price"])
@@ -53,18 +51,11 @@ def fetch_1h():
     ts = ts.with_ema(time_period=200)
     return ts.as_pandas()
 
-@st.cache_data(ttl=300)
-def fetch_5m():
-    ts = td.time_series(symbol="XAU/USD", interval="5min", outputsize=120)
-    ts = ts.with_ema(time_period=200)
-    return ts.as_pandas()
-
 # ─── PARSE AI OUTPUT ───────────────────────────────────────────────────────
 def parse_ai_output(text):
     if not text or not isinstance(text, str):
         return {"verdict": "UNKNOWN", "reason": "No output"}
 
-    # Strip everything outside {}
     start = text.find('{')
     end   = text.rfind('}') + 1
     if start == -1 or end == 0:
@@ -98,7 +89,6 @@ def run_check():
         price = get_live_price()
         ts_15m = fetch_15m()
         ts_1h  = fetch_1h()
-        ts_5m  = fetch_5m()
 
     if ts_15m.empty:
         st.error("No 15m data")
@@ -111,9 +101,8 @@ def run_check():
     ema50_15m  = latest_15m.get('ema_50',  price)
 
     ema200_1h = ts_1h.iloc[-1].get('ema_200', price) if not ts_1h.empty else price
-    ema200_5m = ts_5m.iloc[-1].get('ema_200', price) if not ts_5m.empty else price
 
-    # Optional recent fractals (AIs can ignore)
+    # Optional recent fractals
     levels = []
     for i in range(5, len(ts_15m)-5):
         if ts_15m['high'].iloc[i] == ts_15m['high'].iloc[i-5:i+5].max():
@@ -139,7 +128,6 @@ RSI (15m): {rsi:.1f}
 ATR (15m): {atr:.2f}
 EMA50 / EMA200 (15m): {ema50_15m:.2f} / {ema200_15m:.2f}
 EMA200 (1h): {ema200_1h:.2f}
-EMA200 (5m): {ema200_5m:.2f}
 
 Recent fractals: {', '.join([f"{t}@{p}" for t,p in levels[-6:]]) or 'None'}
 
@@ -164,13 +152,11 @@ Respond **ONLY** with valid JSON. No fences, no markdown, no extra text:
 """
 
     with st.spinner("Consulting AIs..."):
-        # Gemini
         try:
             g_raw = gemini_model.generate_content(prompt).text.strip()
         except:
             g_raw = '{"verdict":"SKIP","reason":"Gemini offline"}'
 
-        # Grok
         try:
             r = grok_client.chat.completions.create(
                 model="grok-4",
@@ -182,7 +168,6 @@ Respond **ONLY** with valid JSON. No fences, no markdown, no extra text:
         except:
             k_raw = '{"verdict":"SKIP","reason":"Grok error"}'
 
-        # OpenAI
         try:
             resp = openai_client.chat.completions.create(
                 model="gpt-4o-mini",
@@ -200,7 +185,7 @@ Respond **ONLY** with valid JSON. No fences, no markdown, no extra text:
 
     high_count = sum(1 for p in [g_p, k_p, c_p] if p["verdict"] in ["ELITE", "HIGH_CONV"])
 
-    # Display verdicts
+    # Display
     col1, col2, col3 = st.columns(3)
     col1.markdown("**Gemini**")
     col1.json(g_p)
@@ -211,19 +196,15 @@ Respond **ONLY** with valid JSON. No fences, no markdown, no extra text:
 
     # Consensus & Telegram
     if high_count >= 2:
-        # Collect valid entries
         entries = [p["entry"] for p in [g_p, k_p, c_p] if p["entry"] is not None]
+        consensus_note = ""
         if len(entries) >= 2:
-            entries_sorted = sorted(entries)
-            median_entry = entries_sorted[len(entries_sorted)//2]
             spread = max(entries) - min(entries)
-            atr_spread_threshold = atr * 0.8  # configurable
-            if spread <= atr_spread_threshold:
-                consensus_entry = f"Consensus entry (within \~0.8 ATR): ${median_entry:.2f}"
+            if spread <= atr * 0.8:
+                median = np.median(entries)
+                consensus_note = f"\nConsensus entry (within \~0.8 ATR): ${median:.2f}"
             else:
-                consensus_entry = "Entries too spread — review manually"
-        else:
-            consensus_entry = "No entry consensus"
+                consensus_note = "\nEntries too spread — review manually"
 
         best = max([g_p, k_p, c_p], key=lambda p: 2 if p["verdict"] == "ELITE" else 1 if p["verdict"] == "HIGH_CONV" else 0)
 
@@ -234,8 +215,7 @@ Respond **ONLY** with valid JSON. No fences, no markdown, no extra text:
             f"Entry: ${best['entry']:.2f}\n"
             f"SL: ${best['sl']:.2f}\n"
             f"TP: ${best['tp']:.2f} (RR \~1:{best['rr']})\n"
-            f"Reason: {best['reason']}\n\n"
-            f"{consensus_entry}\n\n"
+            f"Reason: {best['reason']}{consensus_note}\n\n"
             f"Full verdicts above."
         )
         send_telegram(msg, priority="high" if high_count == 3 else "normal")
@@ -251,16 +231,16 @@ st.title("🥇 Gold Sentinel – AI-Driven Gold Setups")
 st.caption(f"Three AIs decide everything | {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
 
 # Optional account inputs
-with st.expander("Account Info (optional)", expanded=False):
+with st.expander("Account Info (all optional)", expanded=False):
     balance_input = st.number_input("Balance ($)", min_value=0.0, step=0.01, format="%.2f", value=None)
     floor_input   = st.number_input("Floor ($)",   min_value=0.0, step=0.01, format="%.2f", value=None)
-    risk_input    = st.number_input("Risk %",       min_value=0.0, max_value=100.0, step=0.1, format="%.1f", value=None)
+    risk_input    = st.number_input("Risk %",      min_value=0.0, step=0.1, format="%.1f", value=None)
 
-    if balance_input:
+    if balance_input is not None:
         st.session_state.balance = balance_input
-    if floor_input:
+    if floor_input is not None:
         st.session_state.floor = floor_input
-    if risk_input:
+    if risk_input is not None:
         st.session_state.risk_pct = risk_input
 
 if st.button("📡 Run Analysis (\~4 credits)", type="primary", use_container_width=True):
