@@ -254,7 +254,7 @@ Respond **ONLY** with valid JSON. No fences, no markdown, no extra text:
     with col3:
         st.markdown(format_verdict(c_p, "ChatGPT"), unsafe_allow_html=True)
 
-    # Consensus & Telegram
+    # Consensus & Telegram — 2/3 or 3/3 HIGH_CONV/ELITE is enough
     if high_count >= 2:
         entries = [p["entry"] for p in [g_p, k_p, c_p] if p["entry"] is not None]
         consensus_note = ""
@@ -281,7 +281,7 @@ Respond **ONLY** with valid JSON. No fences, no markdown, no extra text:
         send_telegram(msg, priority="high" if high_count == 3 else "normal")
         st.success("High conviction consensus — Telegram sent!")
     else:
-        st.info("No strong consensus — no Telegram sent.")
+        st.info("No strong consensus (need 2/3 or 3/3 HIGH_CONV/ELITE) — no Telegram sent.")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # AUTO-CHECK TIMER (browser-based)
