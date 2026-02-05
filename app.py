@@ -26,7 +26,7 @@ OPPOSING_FRACTAL_ATR_MULT = 0.8
 DEFAULT_BALANCE = 5000.0
 DEFAULT_DAILY_LIMIT = 250.0
 DEFAULT_FLOOR = 4500.0
-DEFAULT_RISK_PCT = 25  # reset to 25
+DEFAULT_RISK_PCT = 25  # Restored to 25
 
 LAST_ALERT_FILE = "last_alert.json"
 
@@ -45,6 +45,22 @@ def retry_api(max_attempts=3, backoff=5):
             return None
         return wrapper
     return decorator
+
+# ─── QUOTA-SAFE TD CALL WRAPPER ──────────────────────────────────────────────
+def safe_td_call(func, *args, **kwargs):
+    try:
+        return func(*args, **kwargs)
+    except Exception as e:
+        err_str = str(e).lower()
+        if "429" in err_str or "credit" in err_str or "quota" in err_str or "limit" in err_str or "rate" in err_str:
+            st.warning("Rate limit hit (likely minutely 8 credits). Waiting 60s to reset bucket...")
+            time.sleep(60)
+            try:
+                return func(*args, **kwargs)  # One safe retry after wait
+            except:
+                st.error("Still limited after wait. Try again in a minute or upgrade plan.")
+                return None
+        raise e  # Other errors get normal retry
 
 # ─── API INIT ────────────────────────────────────────────────────────────────
 try:
@@ -315,12 +331,17 @@ def check_for_high_conviction_setup():
         if imminent:
             return
 
-        live_price = get_current_price()
-        time.sleep(2)
-        ts_15m = fetch_15m_data()
-        time.sleep(2)
-        if ts_15m.empty:
+        live_price = safe_td_call(lambda: float(td.price(symbol="XAU/USD").as_json()["price"]))
+        if live_price is None:
             return
+        time.sleep(2)
+
+        ts_15m = safe_td_call(lambda: td.time_series(symbol="XAU/USD", interval="15min", outputsize=200)
+                              .with_rsi().with_ema(time_period=200).with_ema(time_period=50).with_atr(time_period=14)
+                              .as_pandas())
+        if ts_15m is None or ts_15m.empty:
+            return
+        time.sleep(2)
 
         latest_15m = ts_15m.iloc[-1]
         rsi = latest_15m.get('rsi', 50.0)
@@ -340,10 +361,16 @@ def check_for_high_conviction_setup():
         except:
             pass
 
+        ts_1h = safe_td_call(lambda: td.time_series(symbol="XAU/USD", interval="1h", outputsize=100)
+                             .with_ema(time_period=200).as_pandas())
+        if ts_1h is None:
+            return
         time.sleep(2)
-        ts_1h = fetch_htf_data("1h")
-        time.sleep(2)
-        ts_5m = fetch_htf_data("5min")
+
+        ts_5m = safe_td_call(lambda: td.time_series(symbol="XAU/USD", interval="5min", outputsize=200)
+                             .with_ema(time_period=200).as_pandas())
+        if ts_5m is None:
+            return
 
         ema200_15m = latest_15m.get('ema_200', live_price)
         ema200_1h = ts_1h.iloc[-1].get('ema_200', live_price) if not ts_1h.empty else live_price
@@ -428,11 +455,11 @@ st.set_page_config(page_title="Gold Sentinel Pro", page_icon="🥇", layout="wid
 st.title("🥇 Gold Sentinel – High Conviction Gold Entries")
 st.caption(f"Adaptive engine | Safe auto-check while page open | {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
 
-# Auto-check controls (visible always)
+# Auto-check controls (always visible)
 auto_enabled = st.checkbox("Enable auto-check while this page is open", value=True)
 auto_interval_min = st.slider("Check every (minutes)", 10, 60, 15, step=5)
 
-# Usage monitor (visible always)
+# Usage monitor
 if st.button("🔍 Check Twelve Data Usage (costs 1 credit)"):
     usage = get_td_usage()
     st.json(usage)
@@ -445,6 +472,7 @@ if "analysis_done" not in st.session_state:
     st.session_state.floor = DEFAULT_FLOOR
     st.session_state.risk_pct = DEFAULT_RISK_PCT
     st.session_state.last_analysis = 0
+    st.session_state.last_check_time = 0
 
 if not st.session_state.analysis_done:
     st.header("Account Settings (RF Bronze 5K friendly)")
@@ -467,7 +495,6 @@ if not st.session_state.analysis_done:
             st.session_state.analysis_done = True
             st.rerun()
 
-    # Manual alert button always available
     if st.button("📡 Manual Alert Check Now (\~4 credits)"):
         with st.spinner("Running manual check..."):
             check_for_high_conviction_setup()
@@ -498,32 +525,45 @@ else:
     if utc_now.hour >= 21 and utc_now.hour < 23:
         st.warning("Late NY session — whipsaw risk ↑")
 
-    # ─── SAFE AUTO-CHECK TIMER (runs on every script execution / refresh) ──────
-    CHECK_INTERVAL_SEC = auto_interval_min * 60
+    # AI raw outputs (collapsible)
+    with st.expander("Raw AI Outputs (debug)"):
+        cols = st.columns(3)
+        cols[0].markdown("**Gemini**")
+        cols[0].json(g_raw if 'g_raw' in locals() else "No data yet")
+        cols[1].markdown("**Grok**")
+        cols[1].json(k_raw if 'k_raw' in locals() else "No data yet")
+        cols[2].markdown("**ChatGPT**")
+        cols[2].json(c_raw if 'c_raw' in locals() else "No data yet")
 
-    if auto_enabled:
-        if "last_check_time" not in st.session_state:
-            st.session_state.last_check_time = 0
+# ─── SAFE AUTO-CHECK TIMER (runs on EVERY page load / refresh) ────────────────
+CHECK_INTERVAL_SEC = auto_interval_min * 60
 
-        now = time.time()
-        time_since_last = now - st.session_state.last_check_time
-        if time_since_last >= CHECK_INTERVAL_SEC:
-            st.session_state.last_check_time = now
-            with st.status(f"Auto-checking... (last check {time_since_last/60:.1f} min ago)", expanded=True) as status:
-                check_for_high_conviction_setup()
-                status.update(label=f"Auto-check complete at {datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}", state="complete")
-            st.rerun()
-        else:
-            st.caption(f"Next auto-check in \~{CHECK_INTERVAL_SEC - time_since_last:.0f} seconds")
-    else:
-        st.info("Auto-check paused. Use manual button above.")
+if auto_enabled:
+    if "last_check_time" not in st.session_state:
+        st.session_state.last_check_time = 0
 
-    # Manual alert button in dashboard too
-    if st.button("📡 Manual Alert Check Now (\~4 credits)"):
-        with st.spinner("Running manual check..."):
+    now = time.time()
+    time_since_last = now - st.session_state.last_check_time
+
+    if time_since_last >= CHECK_INTERVAL_SEC:
+        st.session_state.last_check_time = now
+        st.info(f"Auto-check triggered (last was {time_since_last/60:.1f} min ago)")
+        with st.status("Running auto-check...", expanded=True) as status:
             check_for_high_conviction_setup()
-        st.success("Manual check done. See Telegram if setup found.")
-
-    if st.button("Reset to Settings"):
-        st.session_state.analysis_done = False
+            status.update(label=f"Auto-check complete at {datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}", state="complete")
         st.rerun()
+    else:
+        st.caption(f"Next auto-check in \~{int(CHECK_INTERVAL_SEC - time_since_last)} seconds")
+else:
+    st.info("Auto-check paused. Use manual button above.")
+
+# Manual alert button (always available)
+if st.button("📡 Manual Alert Check Now (\~4 credits)"):
+    with st.spinner("Running manual check..."):
+        check_for_high_conviction_setup()
+    st.success("Manual check done. See Telegram if setup found.")
+
+# Reset button
+if st.button("Reset to Settings"):
+    st.session_state.analysis_done = False
+    st.rerun()
