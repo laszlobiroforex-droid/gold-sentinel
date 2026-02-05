@@ -29,7 +29,7 @@ DEFAULT_RISK_PCT = 25
 
 LAST_ALERT_FILE = "last_alert.json"
 
-# ─── SAFE TD CALL (NO BLIND RETRIES ON LIMITS) ────────────────────────────────
+# ─── SAFE TD CALL (FAIL FAST ON LIMITS) ───────────────────────────────────────
 def safe_td(fn):
     try:
         return fn()
@@ -58,7 +58,7 @@ except Exception as e:
 def get_live_price():
     return float(td.price(symbol="XAU/USD").as_json()["price"])
 
-# ─── MARKET DATA (CACHED, SAFE WRAPPED) ──────────────────────────────────────
+# ─── MARKET DATA (CACHED) ────────────────────────────────────────────────────
 @st.cache_data(ttl=300)
 def fetch_15m_data():
     ts = td.time_series(symbol="XAU/USD", interval="15min", outputsize=200)
@@ -77,12 +77,12 @@ def fetch_5m_data():
     ts = ts.with_ema(time_period=200)
     return ts.as_pandas()
 
-# ─── FRACTALS ────────────────────────────────────────────────────────────────
+# ─── FRACTALS & INVALIDATION ─────────────────────────────────────────────────
 def get_fractal_levels(df, window=5, min_dist_factor=0.4):
     if df.empty:
         return []
     levels = []
-    atr = df["atr"].iloc[-1] if "atr" in df else 10.0
+    atr = df.get("atr", pd.Series([10.0])).iloc[-1]
     last_price = df["close"].iloc[-1]
 
     for i in range(window, len(df) - window):
@@ -113,7 +113,7 @@ def load_last_alert():
                 return json.load(f)
         except:
             pass
-    return {"time": 0, "key": None}
+    return {"time": 0, "key": None, "proposal": {}}
 
 def save_last_alert(ts, key, proposal):
     with open(LAST_ALERT_FILE, "w") as f:
@@ -158,14 +158,14 @@ def check_for_high_conviction_setup():
 
     levels = get_fractal_levels(ts_15m)
 
-    # ─── REAL AI CALLS (using already-fetched data only) ─────────────────────
+    # ─── REAL AI CALLS (using pre-fetched data only) ──────────────────────────
     market = {"price": price, "rsi": rsi}
     setup = {"entry": price, "atr": atr}
     buffer = st.session_state.balance - st.session_state.floor
 
     base_prompt = f"""
 You are a high-conviction gold trading auditor.
-Use ONLY the provided data — do NOT hallucinate prices or levels.
+Use ONLY the provided data — do NOT hallucinate prices, levels, or any facts.
 
 Current UTC: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}
 Market: ${price:.2f}, RSI {rsi:.1f}
@@ -174,7 +174,8 @@ Fractals: {', '.join([f"{t}@{p}" for t,p in levels[:6]]) or "None"}
 
 Setup context: entry \~${setup['entry']:.2f}, ATR ${setup['atr']:.2f}, risk buffer ${buffer:.2f}
 
-Respond ONLY with valid JSON — no extra text:
+Respond **ONLY** with valid JSON. No explanations, no fences, no markdown, no extra text before or after.
+
 {{
   "verdict": "ELITE" | "HIGH_CONV" | "LOW_EDGE" | "GAMBLE" | "SKIP",
   "reason": "short explanation",
@@ -191,8 +192,8 @@ Respond ONLY with valid JSON — no extra text:
     # Gemini
     try:
         g_out = gemini_model.generate_content(base_prompt).text.strip()
-    except:
-        g_out = '{"verdict":"SKIP","reason":"Gemini offline"}'
+    except Exception as ex:
+        g_out = f'{{"verdict":"SKIP","reason":"Gemini error: {str(ex)}"}}'
 
     # Grok
     try:
@@ -203,8 +204,8 @@ Respond ONLY with valid JSON — no extra text:
             temperature=0.4
         )
         k_out = r.choices[0].message.content.strip()
-    except:
-        k_out = '{"verdict":"SKIP","reason":"Grok error"}'
+    except Exception as ex:
+        k_out = f'{{"verdict":"SKIP","reason":"Grok error: {str(ex)}"}}'
 
     # OpenAI
     try:
@@ -215,8 +216,8 @@ Respond ONLY with valid JSON — no extra text:
             temperature=0.5
         )
         c_out = response.choices[0].message.content.strip()
-    except:
-        c_out = '{"verdict":"SKIP","reason":"ChatGPT error"}'
+    except Exception as ex:
+        c_out = f'{{"verdict":"SKIP","reason":"OpenAI error: {str(ex)}"}}'
 
     g_p = parse_ai_output(g_out)
     k_p = parse_ai_output(k_out)
@@ -227,7 +228,7 @@ Respond ONLY with valid JSON — no extra text:
     if high_count < MIN_CONVICTION_FOR_ALERT:
         return
 
-    p = g_p  # prefer Gemini as primary
+    p = g_p  # prefer Gemini
     direction = p.get("direction", "NEUTRAL")
     style = p.get("style", "NONE")
     entry = p.get("entry") or price
@@ -257,6 +258,37 @@ Respond ONLY with valid JSON — no extra text:
 
     st.success("High conviction setup detected — check Telegram.")
 
+# ─── PARSE AI OUTPUT (HARDENED) ──────────────────────────────────────────────
+def parse_ai_output(text):
+    if not text or not isinstance(text, str):
+        return {"verdict": "UNKNOWN", "reason": "No output from AI"}
+
+    # Aggressive cleaning
+    text = text.strip()
+    text = re.sub(r'^```json\s*', '', text, flags=re.IGNORECASE)
+    text = re.sub(r'\s*```$', '', text)
+    text = re.sub(r'^Here is the JSON:?\s*', '', text, flags=re.IGNORECASE)
+    text = text.strip()
+
+    try:
+        data = json.loads(text)
+        return {
+            "verdict": data.get("verdict", "UNKNOWN").upper(),
+            "reason": data.get("reason", ""),
+            "entry": data.get("entry"),
+            "sl": data.get("sl"),
+            "tp": data.get("tp"),
+            "rr": data.get("rr"),
+            "style": data.get("style", "NONE").upper(),
+            "direction": data.get("direction", "NEUTRAL").upper(),
+            "reasoning": data.get("reasoning", "")
+        }
+    except json.JSONDecodeError as e:
+        return {
+            "verdict": "PARSE_ERROR",
+            "reason": f"JSON parse failed: {str(e)}. Raw: {text[:200]}..."
+        }
+
 # ─── STREAMLIT UI ────────────────────────────────────────────────────────────
 st.set_page_config("Gold Sentinel Pro", "🥇", layout="wide")
 st.title("🥇 Gold Sentinel – High Conviction Gold Entries")
@@ -275,3 +307,29 @@ st.session_state.risk_pct = st.slider("Risk %", 5, 50, st.session_state.risk_pct
 if st.button("📡 Manual Check (\~4 credits)"):
     with st.spinner("Running check…"):
         check_for_high_conviction_setup()
+
+# Auto-check toggle (optional, for browser keep-alive)
+auto_enabled = st.checkbox("Enable auto-check while page open", value=False)
+auto_interval_min = st.slider("Check every (minutes)", 10, 60, 15, step=5)
+
+# ─── SAFE AUTO-CHECK TIMER (runs on every script execution) ───────────────────
+CHECK_INTERVAL_SEC = auto_interval_min * 60
+
+if auto_enabled:
+    if "last_check_time" not in st.session_state:
+        st.session_state.last_check_time = 0
+
+    now = time.time()
+    time_since_last = now - st.session_state.last_check_time
+
+    if time_since_last >= CHECK_INTERVAL_SEC:
+        st.session_state.last_check_time = now
+        st.info(f"Auto-check triggered (last was {time_since_last/60:.1f} min ago)")
+        with st.status("Running auto-check...", expanded=True) as status:
+            check_for_high_conviction_setup()
+            status.update(label=f"Auto-check complete at {datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}", state="complete")
+        st.rerun()
+    else:
+        st.caption(f"Next auto-check in \~{int(CHECK_INTERVAL_SEC - time_since_last)} seconds")
+else:
+    st.info("Auto-check paused. Use manual button above.")
