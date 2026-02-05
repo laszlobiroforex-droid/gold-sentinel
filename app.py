@@ -46,21 +46,16 @@ def retry_api(max_attempts=3, backoff=5):
         return wrapper
     return decorator
 
-# ─── QUOTA-SAFE TD CALL WRAPPER ──────────────────────────────────────────────
+# ─── STRICT QUOTA-SAFE TD CALL WRAPPER ───────────────────────────────────────
 def safe_td_call(func, *args, **kwargs):
     try:
         return func(*args, **kwargs)
     except Exception as e:
         err_str = str(e).lower()
         if "429" in err_str or "credit" in err_str or "quota" in err_str or "limit" in err_str or "rate" in err_str:
-            st.warning("Minutely rate limit hit (8 credits/min). Waiting 60s to reset...")
-            time.sleep(60)
-            try:
-                return func(*args, **kwargs)  # One retry after wait
-            except:
-                st.error("Still limited after wait. Try again in a minute or upgrade plan.")
-                return None
-        raise e
+            st.error("Twelve Data minutely rate limit hit (8 credits/min). Wait 60–120 seconds and try again. No retry to save credits.")
+            return None  # Immediate stop — no retry
+        raise e  # Other errors get normal retry
 
 # ─── API INIT ────────────────────────────────────────────────────────────────
 try:
@@ -455,7 +450,7 @@ st.title("🥇 Gold Sentinel – High Conviction Gold Entries")
 st.caption(f"Adaptive engine | Safe auto-check while page open | {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
 
 # Auto-check controls (always visible)
-auto_enabled = st.checkbox("Enable auto-check while this page is open", value=False)  # Default off
+auto_enabled = st.checkbox("Enable auto-check while this page is open", value=False)  # Default off for safety
 auto_interval_min = st.slider("Check every (minutes)", 10, 60, 15, step=5)
 
 # Usage monitor
@@ -528,11 +523,11 @@ else:
     with st.expander("Raw AI Outputs (debug)", expanded=False):
         cols = st.columns(3)
         cols[0].markdown("**Gemini**")
-        cols[0].json(g_raw if 'g_raw' in locals() else "No data yet")
+        cols[0].text(g_raw if 'g_raw' in locals() else "No data yet")
         cols[1].markdown("**Grok**")
-        cols[1].json(k_raw if 'k_raw' in locals() else "No data yet")
+        cols[1].text(k_raw if 'k_raw' in locals() else "No data yet")
         cols[2].markdown("**ChatGPT**")
-        cols[2].json(c_raw if 'c_raw' in locals() else "No data yet")
+        cols[2].text(c_raw if 'c_raw' in locals() else "No data yet")
 
 # ─── SAFE AUTO-CHECK TIMER (runs on EVERY page load / refresh) ───────────────────
 CHECK_INTERVAL_SEC = auto_interval_min * 60
