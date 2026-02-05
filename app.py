@@ -26,7 +26,7 @@ OPPOSING_FRACTAL_ATR_MULT = 0.8
 DEFAULT_BALANCE = 5000.0
 DEFAULT_DAILY_LIMIT = 250.0
 DEFAULT_FLOOR = 4500.0
-DEFAULT_RISK_PCT = 25  # Restored to 25
+DEFAULT_RISK_PCT = 25
 
 LAST_ALERT_FILE = "last_alert.json"
 
@@ -53,10 +53,10 @@ def safe_td_call(func, *args, **kwargs):
     except Exception as e:
         err_str = str(e).lower()
         if "429" in err_str or "credit" in err_str or "quota" in err_str or "limit" in err_str or "rate" in err_str:
-            st.warning("Rate limit hit (likely minutely 8 credits). Waiting 60s to reset bucket...")
+            st.warning("Minutely rate limit hit (8 credits/min). Waiting 60s to reset...")
             time.sleep(60)
             try:
-                return func(*args, **kwargs)  # One safe retry after wait
+                return func(*args, **kwargs)  # One retry after wait
             except:
                 st.error("Still limited after wait. Try again in a minute or upgrade plan.")
                 return None
@@ -334,14 +334,14 @@ def check_for_high_conviction_setup():
         live_price = safe_td_call(lambda: float(td.price(symbol="XAU/USD").as_json()["price"]))
         if live_price is None:
             return
-        time.sleep(2)
+        time.sleep(15)
 
         ts_15m = safe_td_call(lambda: td.time_series(symbol="XAU/USD", interval="15min", outputsize=200)
                               .with_rsi().with_ema(time_period=200).with_ema(time_period=50).with_atr(time_period=14)
                               .as_pandas())
         if ts_15m is None or ts_15m.empty:
             return
-        time.sleep(2)
+        time.sleep(15)
 
         latest_15m = ts_15m.iloc[-1]
         rsi = latest_15m.get('rsi', 50.0)
@@ -365,7 +365,7 @@ def check_for_high_conviction_setup():
                              .with_ema(time_period=200).as_pandas())
         if ts_1h is None:
             return
-        time.sleep(2)
+        time.sleep(15)
 
         ts_5m = safe_td_call(lambda: td.time_series(symbol="XAU/USD", interval="5min", outputsize=200)
                              .with_ema(time_period=200).as_pandas())
@@ -456,7 +456,7 @@ st.title("🥇 Gold Sentinel – High Conviction Gold Entries")
 st.caption(f"Adaptive engine | Safe auto-check while page open | {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
 
 # Auto-check controls (always visible)
-auto_enabled = st.checkbox("Enable auto-check while this page is open", value=True)
+auto_enabled = st.checkbox("Enable auto-check while this page is open", value=False)  # Default off for safety
 auto_interval_min = st.slider("Check every (minutes)", 10, 60, 15, step=5)
 
 # Usage monitor
@@ -526,7 +526,7 @@ else:
         st.warning("Late NY session — whipsaw risk ↑")
 
     # AI raw outputs (collapsible)
-    with st.expander("Raw AI Outputs (debug)"):
+    with st.expander("Raw AI Outputs (debug)", expanded=False):
         cols = st.columns(3)
         cols[0].markdown("**Gemini**")
         cols[0].json(g_raw if 'g_raw' in locals() else "No data yet")
@@ -535,7 +535,7 @@ else:
         cols[2].markdown("**ChatGPT**")
         cols[2].json(c_raw if 'c_raw' in locals() else "No data yet")
 
-# ─── SAFE AUTO-CHECK TIMER (runs on EVERY page load / refresh) ────────────────
+# ─── SAFE AUTO-CHECK TIMER (runs on EVERY script execution) ───────────────────
 CHECK_INTERVAL_SEC = auto_interval_min * 60
 
 if auto_enabled:
