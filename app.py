@@ -9,9 +9,8 @@ import requests
 import numpy as np
 
 # ─── CONFIG ────────────────────────────────────────────────────────────────
-DEFAULT_BALANCE = None  # optional
-DEFAULT_FLOOR    = None
-DEFAULT_RISK_PCT = None
+# No defaults — all optional
+# Risk % is free-typed (0.1 step)
 
 # ─── API INIT ──────────────────────────────────────────────────────────────
 td = TDClient(apikey=st.secrets["TWELVE_DATA_KEY"])
@@ -26,7 +25,7 @@ def send_telegram(message, priority="normal"):
     token   = st.secrets.get("TELEGRAM_BOT_TOKEN")
     chat_id = st.secrets.get("TELEGRAM_CHAT_ID")
     if not token or not chat_id:
-        st.warning("Telegram not configured")
+        st.warning("Telegram not configured (add TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID to secrets)")
         return
 
     emoji = "🟢 ELITE" if priority == "high" else "🔵 Conviction"
@@ -114,7 +113,7 @@ def run_check():
     ema200_1h = ts_1h.iloc[-1].get('ema_200', price) if not ts_1h.empty else price
     ema200_5m = ts_5m.iloc[-1].get('ema_200', price) if not ts_5m.empty else price
 
-    # Optional: recent fractals (AIs can use or ignore)
+    # Optional recent fractals (AIs can ignore)
     levels = []
     for i in range(5, len(ts_15m)-5):
         if ts_15m['high'].iloc[i] == ts_15m['high'].iloc[i-5:i+5].max():
@@ -122,10 +121,10 @@ def run_check():
         if ts_15m['low'].iloc[i] == ts_15m['low'].iloc[i-5:i+5].min():
             levels.append(('SUP', round(ts_15m['low'].iloc[i], 2)))
 
-    balance = st.session_state.get("balance")
-    floor    = st.session_state.get("floor")
-    risk_pct = st.session_state.get("risk_pct")
-    buffer   = (balance - floor) if balance is not None and floor is not None else None
+    balance   = st.session_state.get("balance")
+    floor     = st.session_state.get("floor")
+    risk_pct  = st.session_state.get("risk_pct")
+    buffer    = (balance - floor) if balance is not None and floor is not None else None
 
     prompt = f"""
 You are a high-conviction gold trading auditor.
@@ -201,7 +200,7 @@ Respond **ONLY** with valid JSON. No fences, no markdown, no extra text:
 
     high_count = sum(1 for p in [g_p, k_p, c_p] if p["verdict"] in ["ELITE", "HIGH_CONV"])
 
-    # Display
+    # Display verdicts
     col1, col2, col3 = st.columns(3)
     col1.markdown("**Gemini**")
     col1.json(g_p)
@@ -212,20 +211,19 @@ Respond **ONLY** with valid JSON. No fences, no markdown, no extra text:
 
     # Consensus & Telegram
     if high_count >= 2:
-        # Pick median entry if close enough
+        # Collect valid entries
         entries = [p["entry"] for p in [g_p, k_p, c_p] if p["entry"] is not None]
         if len(entries) >= 2:
             entries_sorted = sorted(entries)
             median_entry = entries_sorted[len(entries_sorted)//2]
-            # Check spread
             spread = max(entries) - min(entries)
-            atr_spread_threshold = atr * 0.8  # \~0.8 ATR
+            atr_spread_threshold = atr * 0.8  # configurable
             if spread <= atr_spread_threshold:
-                consensus_entry = median_entry
+                consensus_entry = f"Consensus entry (within \~0.8 ATR): ${median_entry:.2f}"
             else:
-                consensus_entry = None
+                consensus_entry = "Entries too spread — review manually"
         else:
-            consensus_entry = None
+            consensus_entry = "No entry consensus"
 
         best = max([g_p, k_p, c_p], key=lambda p: 2 if p["verdict"] == "ELITE" else 1 if p["verdict"] == "HIGH_CONV" else 0)
 
@@ -237,10 +235,9 @@ Respond **ONLY** with valid JSON. No fences, no markdown, no extra text:
             f"SL: ${best['sl']:.2f}\n"
             f"TP: ${best['tp']:.2f} (RR \~1:{best['rr']})\n"
             f"Reason: {best['reason']}\n\n"
+            f"{consensus_entry}\n\n"
             f"Full verdicts above."
         )
-        if consensus_entry:
-            msg += f"\nConsensus entry (within \~0.8 ATR): ${consensus_entry:.2f}"
         send_telegram(msg, priority="high" if high_count == 3 else "normal")
         st.success("High conviction consensus — Telegram sent!")
     else:
@@ -255,9 +252,16 @@ st.caption(f"Three AIs decide everything | {datetime.now(timezone.utc).strftime(
 
 # Optional account inputs
 with st.expander("Account Info (optional)", expanded=False):
-    st.session_state.balance = st.number_input("Balance ($)", value=st.session_state.get("balance"))
-    st.session_state.floor   = st.number_input("Floor ($)",   value=st.session_state.get("floor"))
-    st.session_state.risk_pct = st.slider("Risk %", 5, 50, st.session_state.get("risk_pct", 25), step=5)
+    balance_input = st.number_input("Balance ($)", min_value=0.0, step=0.01, format="%.2f", value=None)
+    floor_input   = st.number_input("Floor ($)",   min_value=0.0, step=0.01, format="%.2f", value=None)
+    risk_input    = st.number_input("Risk %",       min_value=0.0, max_value=100.0, step=0.1, format="%.1f", value=None)
+
+    if balance_input:
+        st.session_state.balance = balance_input
+    if floor_input:
+        st.session_state.floor = floor_input
+    if risk_input:
+        st.session_state.risk_pct = risk_input
 
 if st.button("📡 Run Analysis (\~4 credits)", type="primary", use_container_width=True):
     run_check()
