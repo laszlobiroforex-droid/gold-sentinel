@@ -2,12 +2,38 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import re
+import time
+import json
+from datetime import datetime, timezone, timedelta
 from twelvedata import TDClient
 import google.generativeai as genai
 from openai import OpenAI
-from datetime import datetime
+import requests
+import os
+from bs4 import BeautifulSoup
 
-# ─── API INIT ────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# CONFIG
+# ─────────────────────────────────────────────────────────────────────────────
+SPREAD_BUFFER_POINTS = 0.30
+SLIPPAGE_BUFFER_POINTS = 0.20
+PIP_VALUE = 100
+
+ALERT_COOLDOWN_MIN = 30
+MIN_CONVICTION_FOR_ALERT = 2
+MAX_SL_ATR_MULT = 2.2
+OPPOSING_FRACTAL_ATR_MULT = 0.8
+
+DEFAULT_BALANCE = 5000.0
+DEFAULT_DAILY_LIMIT = 250.0
+DEFAULT_FLOOR = 4500.0
+DEFAULT_RISK_PCT = 25
+
+LAST_ALERT_FILE = "last_alert.json"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# API INIT
+# ─────────────────────────────────────────────────────────────────────────────
 try:
     td = TDClient(apikey=st.secrets["TWELVE_DATA_KEY"])
     genai.configure(api_key=st.secrets["GEMINI_KEY"])
@@ -24,7 +50,9 @@ except Exception as e:
     st.error(f"API setup failed: {e}\nCheck secrets: TWELVE_DATA_KEY, GEMINI_KEY, GROK_API_KEY, OPENAI_API_KEY")
     st.stop()
 
-# ─── FRACTAL LEVELS ──────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# FRACTAL LEVELS
+# ─────────────────────────────────────────────────────────────────────────────
 def get_fractal_levels(df, window=5):
     levels = []
     for i in range(window, len(df) - window):
@@ -34,10 +62,13 @@ def get_fractal_levels(df, window=5):
             levels.append(('SUP', round(df['low'].iloc[i], 2)))
     return levels
 
-# ─── TRIPLE AUDITORS ─────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# TRIPLE AUDITORS (with hallucination hardening)
+# ─────────────────────────────────────────────────────────────────────────────
 def get_ai_advice(market, setup, levels, buffer, mode):
     levels_str = ", ".join([f"{l[0]}@{l[1]}" for l in levels[-5:]]) if levels else "No clear levels"
     current_price = market['price']
+
     prompt = f"""
 You are a high-conviction gold trading auditor for any account size.
 Mode: {mode} ({'standard swing (15m + 1h)' if mode == 'Standard' else 'fast scalp (15m + 5m)'}).
@@ -70,6 +101,20 @@ REASONING: [1-2 sentences why it's better]
 
 If no meaningful change is needed or no good trade exists, just say "No better alternative — skip or wait".
 Keep total response under 5 sentences.
+
+Respond **ONLY** with valid JSON. No explanations, no fences, no markdown, no extra text before or after.
+
+{{
+  "verdict": "ELITE" | "HIGH_CONV" | "LOW_EDGE" | "GAMBLE" | "SKIP",
+  "reason": "short explanation",
+  "entry": number or null,
+  "sl": number or null,
+  "tp": number or null,
+  "rr": number or null,
+  "style": "SCALP" | "SWING" | "BREAKOUT" | "REVERSAL" | "RANGE" | "NONE",
+  "direction": "BULLISH" | "BEARISH" | "NEUTRAL",
+  "reasoning": "1-2 sentences"
+}}
 """
 
     # Gemini
@@ -103,12 +148,49 @@ Keep total response under 5 sentences.
 
     return g_out, k_out, c_out
 
-# ─── APP ─────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# PARSE AI OUTPUT (HARDENED)
+# ─────────────────────────────────────────────────────────────────────────────
+def parse_ai_output(text):
+    if not text or not isinstance(text, str):
+        return {"verdict": "UNKNOWN", "reason": "No output"}
+
+    # Aggressive cleaning
+    text = text.strip()
+    text = re.sub(r'^```json\s*', '', text, flags=re.IGNORECASE)
+    text = re.sub(r'\s*```$', '', text)
+    text = re.sub(r'^Here is the JSON:?\s*', '', text, flags=re.IGNORECASE)
+    text = text.strip()
+
+    try:
+        data = json.loads(text)
+        return {
+            "verdict": data.get("verdict", "UNKNOWN").upper(),
+            "reason": data.get("reason", ""),
+            "entry": data.get("entry"),
+            "sl": data.get("sl"),
+            "tp": data.get("tp"),
+            "rr": data.get("rr"),
+            "style": data.get("style", "NONE").upper(),
+            "direction": data.get("direction", "NEUTRAL").upper(),
+            "reasoning": data.get("reasoning", "")
+        }
+    except json.JSONDecodeError as e:
+        return {
+            "verdict": "PARSE_ERROR",
+            "reason": f"JSON parse failed: {str(e)}. Raw: {text[:200]}..."
+        }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# APP
+# ─────────────────────────────────────────────────────────────────────────────
 st.set_page_config(page_title="Gold Sentinel Pro", page_icon="🥇", layout="wide")
 st.title("🥇 Gold Sentinel – High Conviction Gold Entries")
 st.caption(f"Adaptive pullback engine | {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}")
 
-# ─── SESSION STATE INIT ──────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# SESSION STATE INIT
+# ─────────────────────────────────────────────────────────────────────────────
 if "analysis_done" not in st.session_state:
     st.session_state.analysis_done = False
     st.session_state.balance = None
@@ -120,7 +202,9 @@ if "analysis_done" not in st.session_state:
 if "saved_setups" not in st.session_state:
     st.session_state.saved_setups = []
 
-# ─── INPUTS ──────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# INPUTS
+# ─────────────────────────────────────────────────────────────────────────────
 if not st.session_state.analysis_done:
     st.header("Account Settings")
     col1, col2 = st.columns(2)
@@ -156,7 +240,9 @@ if not st.session_state.analysis_done:
             st.session_state.analysis_done = True
             st.rerun()
 else:
-    # ─── REMINDER ────────────────────────────────────────────────────────────
+    # ────────────────────────────────────────────────────────────────────────
+    # DASHBOARD
+    # ────────────────────────────────────────────────────────────────────────
     st.info("Analysis locked with your settings:")
     cols = st.columns(5)
     cols[0].metric("Balance", f"${st.session_state.balance:.2f}")
@@ -170,7 +256,6 @@ else:
             price_data = td.price(**{"symbol": "XAU/USD"}).as_json()
             live_price = float(price_data["price"])
 
-            # ─── DATA FETCH ──────────────────────────────────────────────────────
             ts_15m = td.time_series(**{
                 "symbol": "XAU/USD",
                 "interval": "15min",
@@ -192,7 +277,6 @@ else:
                 }).with_ema(**{"time_period": 200}).as_pandas()
                 htf_label = "5M"
 
-            # ─── SAFE INDICATOR EXTRACTION ───────────────────────────────────────
             rsi = ts_15m['rsi'].iloc[0] if 'rsi' in ts_15m.columns else 50.0
             atr = ts_15m['atr'].iloc[0] if 'atr' in ts_15m.columns else 0.0
 
@@ -204,7 +288,6 @@ else:
             ema_cols_htf = [c for c in ts_htf.columns if 'ema' in c.lower()]
             ema200_htf = ts_htf[ema_cols_htf[0]].iloc[0] if ema_cols_htf else live_price
 
-            # ─── TREND ALIGNMENT ─────────────────────────────────────────────────
             aligned = (live_price > ema200_15m and live_price > ema200_htf) or \
                       (live_price < ema200_15m and live_price < ema200_htf)
 
@@ -216,12 +299,10 @@ else:
 
             bias = "BULLISH" if live_price > ema200_15m else "BEARISH"
 
-            # ─── FRACTAL LEVELS ──────────────────────────────────────────────────
             levels = get_fractal_levels(ts_15m)
             resistances = sorted([l[1] for l in levels if l[0] == 'RES' and l[1] > live_price])
             supports = sorted([l[1] for l in levels if l[0] == 'SUP' and l[1] < live_price], reverse=True)
 
-            # ─── CALCULATE ORIGINAL SETUP ────────────────────────────────────────
             sl_dist = round(atr * 1.5, 2)
             min_sl_distance = atr * 0.4
             min_rr = 1.2
@@ -246,22 +327,13 @@ else:
                 
                 tp = supports[0] if supports else entry - (sl_dist * 2.5)
 
-            # ─── RISK CALC EARLY ─────────────────────────────────────────────────
             buffer = st.session_state.balance - st.session_state.floor
             cash_risk = min(buffer * (st.session_state.risk_pct / 100), st.session_state.daily_limit or buffer)
 
-            # Dynamic min risk
-            min_risk_vol = atr * 100 * 0.01 * 2
-            min_risk_pct = buffer * 0.005
-            min_risk_hard = 10
-            min_risk_overall = max(min_risk_vol, min_risk_pct, min_risk_hard)
-
-            # Temporary lots/risk for AI
             sl_dist_actual_temp = abs(entry - sl)
             lots_temp = max(round(cash_risk / ((sl_dist_actual_temp + 0.35) * 100), 2), 0.01) if sl_dist_actual_temp > 0 else 0.01
             actual_risk_temp = round(lots_temp * (sl_dist_actual_temp + 0.35) * 100, 2)
 
-            # ─── TRIPLE AI OPINIONS ──────────────────────────────────────────────
             st.divider()
             st.subheader("Triple AI Opinions")
             market = {"price": live_price, "rsi": rsi}
@@ -281,13 +353,11 @@ else:
 
             st.caption("AI opinions are probabilistic assessments, not trading signals.")
 
-            # ─── CONSENSUS SUMMARY ───────────────────────────────────────────────
             verdicts = [g_verdict.lower(), k_verdict.lower(), c_verdict.lower()]
             proposals = [v for v in [g_verdict, k_verdict, c_verdict] if "PROPOSAL:" in v]
             elite_count = sum(1 for v in verdicts if "elite" in v)
             gamble_count = sum(1 for v in verdicts if "gamble" in v or "low-edge" in v)
 
-            # Main consensus badge
             if elite_count == 3:
                 st.success("3/3 High Conviction – Strongest signal")
             elif elite_count == 2:
@@ -297,9 +367,7 @@ else:
             else:
                 st.info("Mixed opinions – Review all three carefully")
 
-            # ─── PROPOSALS BOX (only if 2+ similar proposals) ────────────────────
             if len(proposals) >= 2:
-                # Simple extraction of proposed entry/SL/TP (regex, crude but good enough)
                 entries = []
                 sls = []
                 tps = []
@@ -328,7 +396,6 @@ else:
                     avg_tp = np.mean(tps)
                     st.markdown(f"<div style='padding:8px; background-color:#444; color:white;'>Avg proposed TP: ${avg_tp:.2f}</div>", unsafe_allow_html=True)
 
-            # ─── APPLY HARD FILTERS AFTER AI ─────────────────────────────────────
             valid_direction = (bias == "BULLISH" and sl < entry) or (bias == "BEARISH" and sl > entry)
             risk_dist = abs(entry - sl)
             reward_dist = abs(tp - entry)
@@ -338,7 +405,7 @@ else:
             warning_msgs = []
 
             if cash_risk < min_risk_overall:
-                warning_msgs.append(f"Risk too small (\( {cash_risk:.2f}) vs dynamic min ( \){min_risk_overall:.2f})")
+                warning_msgs.append(f"Risk too small ({cash_risk:.2f}) vs dynamic min ({min_risk_overall:.2f})")
                 setup_valid = False
             if not valid_direction:
                 warning_msgs.append("Invalid risk direction (SL on wrong side of entry)")
@@ -353,7 +420,7 @@ else:
                 actual_risk = round(lots * (sl_dist_actual + 0.35) * 100, 2)
 
                 st.divider()
-                st.markdown(f"### {action_header}")
+                st.markdown(f"### {bias} Setup")
                 with st.container(border=True):
                     st.metric("Entry", f"${entry:.2f}")
                     col_sl, col_tp = st.columns(2)
@@ -368,16 +435,13 @@ else:
             else:
                 st.warning("Setup rejected by filters:\n" + "\n".join(warning_msgs) + "\nSee AI opinions for alternatives or skip")
 
-            # Levels (always show)
             with st.expander("Detected Fractal Levels"):
                 st.write("**Resistance above:**", resistances[:3] or "None nearby")
                 st.write("**Support below:**", supports[:3] or "None nearby")
 
-            # Accept button
             if st.button("✅ Accept This Setup"):
                 st.success("Setup accepted! (Notification pause logic can be added in PWA version)")
 
-            # Save to history
             st.session_state.saved_setups.append({
                 "time": datetime.utcnow().strftime("%H:%M UTC"),
                 "mode": st.session_state.mode,
@@ -394,7 +458,9 @@ else:
         except Exception as e:
             st.error(f"Error: {str(e)}")
 
-# ─── HISTORY ─────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# HISTORY
+# ─────────────────────────────────────────────────────────────────────────────
 st.divider()
 st.subheader("Recent Setups")
 if st.session_state.saved_setups:
