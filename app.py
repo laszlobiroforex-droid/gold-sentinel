@@ -31,7 +31,6 @@ DEFAULT_FLOOR = 4500.0
 DEFAULT_RISK_PCT = 25
 
 LAST_ALERT_FILE = "last_alert.json"
-EVENTS_CACHE_FILE = "events_cache.json"  # Persist scraped events briefly
 
 # ─── RETRY HELPER ────────────────────────────────────────────────────────────
 def retry_api(max_attempts=3, backoff=5):
@@ -98,19 +97,19 @@ def fetch_upcoming_events():
                 continue
             try:
                 event_time = datetime.strptime(time_str, "%b %d, %Y %H:%M").replace(tzinfo=timezone.utc)
-                # Adjust if no year/month → assume current or next
                 if event_time < now_utc - timedelta(days=1):
-                    event_time += timedelta(days=365)  # rough next year fallback
+                    event_time += timedelta(days=365)
             except:
                 continue
 
             currency = row.find("td", class_="flagCur").get_text(strip=True)
-            impact = row.find("td", class_="sentiment").find_all("i", class_="grayFull")  # red = high
-            impact_level = 3 - len([i for i in impact if "gray" in i["class"]])  # 3 = high, 2=med, etc.
+            impact_icons = row.find("td", class_="sentiment").find_all("i", class_="grayFull")
+            impact_level = 3 - len([i for i in impact_icons if "gray" in i["class"]])
 
             event_name = row.find("td", class_="event").get_text(strip=True)
 
-            if impact_level >= 2 and (currency in ["USD", "XAU", "ALL"] or any(kw in event_name.lower() for kw in ["fed", "cpi", "nfp", "payroll", "fomc", "rate", "inflation", "geopol"])):
+            if impact_level >= 2 and (currency in ["USD", "XAU", "ALL"] or 
+                                      any(kw in event_name.lower() for kw in ["fed", "cpi", "nfp", "payroll", "fomc", "rate", "inflation", "geopol"])):
                 events.append({
                     "time": event_time,
                     "name": event_name,
@@ -119,7 +118,7 @@ def fetch_upcoming_events():
                     "minutes_away": (event_time - now_utc).total_seconds() / 60
                 })
 
-        return sorted(events, key=lambda x: x["time"])[:8]  # next 8 relevant
+        return sorted(events, key=lambda x: x["time"])[:8]
     except Exception as e:
         st.warning(f"Calendar scrape failed: {e}. Using no event data.")
         return []
@@ -127,7 +126,7 @@ def fetch_upcoming_events():
 def get_relevant_event_warning():
     events = fetch_upcoming_events()
     if not events:
-        return None, None
+        return "", None
 
     now = datetime.now(timezone.utc)
     reminder_event = None
@@ -137,15 +136,15 @@ def get_relevant_event_warning():
         mins = ev["minutes_away"]
         if 15 <= mins <= 45:
             reminder_event = ev
-        if 0 < mins <= 120:  # warn up to 2h ahead
-            warning_text += f"⚠️ {ev['impact']} event in ~{int(mins)} min: {ev['name']} ({ev['currency']})\n"
+        if 0 < mins <= 120:
+            warning_text += f"⚠️ {ev['impact']} event in \~{int(mins)} min: {ev['name']} ({ev['currency']})\n"
 
     return warning_text.strip(), reminder_event
 
 def send_event_reminder_if_needed():
     _, reminder_ev = get_relevant_event_warning()
     if reminder_ev:
-        msg = f"🚨 REMINDER: High-impact event approaching in ~{int(reminder_ev['minutes_away'])} min!\n{reminder_ev['name']} ({reminder_ev['currency']})\nConsider closing Gold positions / avoiding new entries."
+        msg = f"🚨 REMINDER: High-impact event approaching in \~{int(reminder_ev['minutes_away'])} min!\n{reminder_ev['name']} ({reminder_ev['currency']})\nConsider closing Gold positions / avoiding new entries."
         send_telegram(msg, priority="high")
 
 # ─── FRACTAL LEVELS + INVALIDATION ───────────────────────────────────────────
@@ -169,7 +168,7 @@ def check_opposing_invalidation(levels, direction, entry, atr):
     threshold = atr * OPPOSING_FRACTAL_ATR_MULT
     if "BULL" in direction:
         close_res = [p for t, p in levels if t == 'RES' and entry < p < entry + threshold]
-        return bool(close_res)  # True = invalid (resistance too close)
+        return bool(close_res)
     elif "BEAR" in direction:
         close_sup = [p for t, p in levels if t == 'SUP' and entry - threshold < p < entry]
         return bool(close_sup)
@@ -191,10 +190,20 @@ def fetch_htf_data(interval):
     ts = ts.with_ema(time_period=200)
     return ts.as_pandas()
 
-@st.cache_data(ttl=60)
+@st.cache_data(ttl=180)  # increased slightly to reduce price calls
 @retry_api()
 def get_current_price():
     return float(td.price(symbol="XAU/USD").as_json()["price"])
+
+# ─── TWELVE DATA USAGE CHECK ─────────────────────────────────────────────────
+def get_td_usage():
+    try:
+        resp = requests.get(
+            f"https://api.twelvedata.com/api_usage?apikey={st.secrets['TWELVE_DATA_KEY']}"
+        )
+        return resp.json()
+    except Exception as e:
+        return {"error": str(e)}
 
 # ─── AI ADVICE ───────────────────────────────────────────────────────────────
 @retry_api()
@@ -212,7 +221,7 @@ Current UTC: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')} (watch 
 Market: ${current_price:.2f}, RSI {market['rsi']:.1f}
 Trend: 15m vs 1H EMA200: {'agree' if aligned_1h else 'disagree'}, 15m vs 5M EMA200: {'agree' if aligned_5m else 'disagree'}
 Fractals: {levels_str}
-Setup context: entry ~${setup['entry']:.2f}, ATR ${setup['atr']:.2f}, risk buffer ${buffer:.2f}
+Setup context: entry \~${setup['entry']:.2f}, ATR ${setup['atr']:.2f}, risk buffer ${buffer:.2f}
 
 Respond ONLY with valid JSON:
 {{
@@ -255,7 +264,7 @@ Respond ONLY with valid JSON:
     except:
         c_out = '{"verdict":"SKIP","reason":"ChatGPT error"}'
 
-    return g_raw, k_out, c_out
+    return g_out, k_out, c_out
 
 # ─── PARSE AI OUTPUT ─────────────────────────────────────────────────────────
 def parse_ai_output(text):
@@ -274,7 +283,7 @@ def parse_ai_output(text):
             "reasoning": data.get("reasoning", "")
         }
     except:
-        return {"verdict": "UNKNOWN", "reason": "Parsing failed", "proposal": "NONE"}
+        return {"verdict": "UNKNOWN", "reason": "Parsing failed"}
 
 # ─── LAST ALERT PERSISTENCE ──────────────────────────────────────────────────
 def load_last_alert():
@@ -293,7 +302,7 @@ def save_last_alert(time_val, key, proposal):
     except:
         pass
 
-# ─── ALERT CHECK ─────────────────────────────────────────────────────────────
+# ─── ALERT CHECK (now manual only) ───────────────────────────────────────────
 def check_for_high_conviction_setup():
     last = load_last_alert()
     now_ts = time.time()
@@ -301,19 +310,19 @@ def check_for_high_conviction_setup():
         return
 
     try:
-        # Event checks first
         warning_text, reminder_ev = get_relevant_event_warning()
         if reminder_ev:
             send_event_reminder_if_needed()
 
-        # Pause if event < 60 min away
         events = fetch_upcoming_events()
         imminent = any(0 < ev["minutes_away"] < 60 for ev in events if ev["impact"] == "High")
         if imminent:
-            return  # skip alert generation
+            return
 
         live_price = get_current_price()
+        time.sleep(2)  # spread calls
         ts_15m = fetch_15m_data()
+        time.sleep(2)
         if ts_15m.empty:
             return
 
@@ -335,7 +344,9 @@ def check_for_high_conviction_setup():
         except:
             pass
 
+        time.sleep(2)
         ts_1h = fetch_htf_data("1h")
+        time.sleep(2)
         ts_5m = fetch_htf_data("5min")
 
         ema200_15m = latest_15m.get('ema_200', live_price)
@@ -353,7 +364,7 @@ def check_for_high_conviction_setup():
         high_count = sum(1 for p in [g_p, k_p, c_p] if p["verdict"] in ["ELITE", "HIGH_CONV"])
 
         if high_count >= MIN_CONVICTION_FOR_ALERT:
-            p = g_p  # Gemini primary
+            p = g_p
             direction = p.get("direction", "NEUTRAL")
             style = p.get("style", "NONE")
             entry = p.get("entry") or live_price
@@ -361,7 +372,6 @@ def check_for_high_conviction_setup():
             proposed_tp = p.get("tp")
             rr = p.get("rr") or 2.0
 
-            # Apply SL cap
             default_sl_dist = atr * 1.5
             if proposed_sl:
                 sl_dist = abs(entry - proposed_sl)
@@ -372,14 +382,12 @@ def check_for_high_conviction_setup():
 
             tp = proposed_tp or (entry + atr*3 if "BULL" in direction else entry - atr*3)
 
-            # Opposing invalidation check
             invalidated = check_opposing_invalidation(levels, direction, entry, atr)
             if invalidated:
-                high_count -= 1  # downgrade
+                high_count -= 1
                 if high_count < MIN_CONVICTION_FOR_ALERT:
                     return
 
-            # Lot sizing
             cash_risk = min(buffer * (risk_pct / 100), daily_limit or buffer)
             risk_dist = abs(entry - sl) + SPREAD_BUFFER_POINTS + SLIPPAGE_BUFFER_POINTS
             risk_per_lot = risk_dist * PIP_VALUE
@@ -395,8 +403,8 @@ def check_for_high_conviction_setup():
             msg = (
                 f"**High Conviction Setup!** ({high_count}/3)\n"
                 f"Style: {style}\nDirection: {direction}\n"
-                f"Entry: ${entry:.2f}\nSL: ${sl:.2f}\nTP: ${tp:.2f} (R:R ~1:{rr:.1f})\n"
-                f"**Proposed lots: {lots:.2f}** (risk ~${actual_risk:.0f})\n"
+                f"Entry: ${entry:.2f}\nSL: ${sl:.2f}\nTP: ${tp:.2f} (R:R \~1:{rr:.1f})\n"
+                f"**Proposed lots: {lots:.2f}** (risk \~${actual_risk:.0f})\n"
                 f"Price: ${live_price:.2f} | RSI {rsi:.1f}{event_warning}"
             )
             priority = "high" if high_count == 3 else "normal"
@@ -417,23 +425,26 @@ def check_for_high_conviction_setup():
             save_last_alert(now_ts, key, proposal_data)
 
     except Exception as e:
-        st.error(f"Background alert failed: {str(e)}")
+        st.error(f"Analysis failed: {str(e)}")
 
-# ─── BACKGROUND THREAD ───────────────────────────────────────────────────────
-def run_background_checker():
-    schedule.every(15).minutes.do(check_for_high_conviction_setup)
-    while True:
-        schedule.run_pending()
-        time.sleep(1)
-
-if "checker_started" not in st.session_state:
-    st.session_state.checker_started = True
-    threading.Thread(target=run_background_checker, daemon=True).start()
+# ─── BACKGROUND THREAD DISABLED ──────────────────────────────────────────────
+# The background checker is commented out to stop automatic credit usage
+# Uncomment only after upgrading plan or adding burst protection
+#
+# def run_background_checker():
+#     schedule.every(15).minutes.do(check_for_high_conviction_setup)
+#     while True:
+#         schedule.run_pending()
+#         time.sleep(1)
+#
+# if "checker_started" not in st.session_state:
+#     st.session_state.checker_started = True
+#     threading.Thread(target=run_background_checker, daemon=True).start()
 
 # ─── STREAMLIT UI ────────────────────────────────────────────────────────────
 st.set_page_config(page_title="Gold Sentinel Pro", page_icon="🥇", layout="wide")
 st.title("🥇 Gold Sentinel – High Conviction Gold Entries")
-st.caption(f"Adaptive engine | Background every 15 min | {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
+st.caption(f"Adaptive engine | Manual mode only (background disabled) | {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
 
 if "analysis_done" not in st.session_state:
     st.session_state.analysis_done = False
@@ -442,6 +453,11 @@ if "analysis_done" not in st.session_state:
     st.session_state.floor = DEFAULT_FLOOR
     st.session_state.risk_pct = DEFAULT_RISK_PCT
     st.session_state.last_analysis = 0
+
+# Twelve Data Usage Monitor
+if st.button("🔍 Check Twelve Data Usage (costs 1 credit)"):
+    usage = get_td_usage()
+    st.json(usage)
 
 if not st.session_state.analysis_done:
     st.header("Account Settings (RF Bronze 5K friendly)")
@@ -470,7 +486,6 @@ else:
     cols[2].metric("Floor", f"${st.session_state.floor:.2f}")
     cols[3].metric("Risk %", f"{st.session_state.risk_pct}%")
 
-    # Last Alert Summary Card
     last = load_last_alert()
     if last.get("proposal"):
         p = last["proposal"]
@@ -480,8 +495,9 @@ else:
             col1, col2 = st.columns(2)
             col1.metric("Entry", f"${p.get('entry', 0):.2f}")
             col2.metric("SL / TP", f"${p.get('sl', 0):.2f} → ${p.get('tp', 0):.2f}")
-            st.metric("Proposed Lots", f"{p.get('lots', 0.01):.2f}", f"Risk ~${p.get('risk', 0):.0f}")
-            st.caption(f"R:R ~1:{p.get('rr', '?.1f')}")
+            st.metric("Proposed Lots", f"{p.get('lots', 0.01):.2f}", f"Risk \~${p.get('risk', 0):.0f}")
+            rr_value = p.get('rr', '?')
+            st.caption(f"R:R \~1:{rr_value:.1f}" if isinstance(rr_value, (int, float)) else f"R:R \~1:{rr_value}")
             if p.get("event_warning"):
                 st.warning(p["event_warning"])
 
@@ -489,83 +505,12 @@ else:
     if utc_now.hour >= 21 and utc_now.hour < 23:
         st.warning("Late NY session — whipsaw risk ↑")
 
-    with st.spinner("Fetching data, calendar & auditing..."):
+    with st.spinner("Fetching data & auditing..."):
         try:
-            live_price = get_current_price()
-            ts_15m = fetch_15m_data()
-            if ts_15m.empty:
-                raise ValueError("15m data empty")
+            check_for_high_conviction_setup()  # now called manually only
 
-            latest_15m = ts_15m.iloc[-1]
-            rsi = latest_15m.get('rsi', 50.0)
-            atr = latest_15m.get('atr', 10.0)
-
-            ts_1h = fetch_htf_data("1h")
-            ts_5m = fetch_htf_data("5min")
-
-            ema200_15m = latest_15m.get('ema_200', live_price)
-            ema200_1h = ts_1h.iloc[-1].get('ema_200', live_price) if not ts_1h.empty else live_price
-            ema200_5m = ts_5m.iloc[-1].get('ema_200', live_price) if not ts_5m.empty else live_price
-
-            aligned_1h = (live_price > ema200_15m) == (live_price > ema200_1h)
-            aligned_5m = (live_price > ema200_15m) == (live_price > ema200_5m)
-
-            market = {"price": live_price, "rsi": rsi}
-            levels = get_fractal_levels(ts_15m)
-            buffer = st.session_state.balance - st.session_state.floor
-
-            setup = {"entry": live_price, "sl_distance": atr*1.5, "atr": atr, "risk_pct": st.session_state.risk_pct}
-
-            g_raw, k_raw, c_raw = get_ai_advice(market, setup, levels, buffer, aligned_1h, aligned_5m)
-
-            g_p = parse_ai_output(g_raw)
-            k_p = parse_ai_output(k_raw)
-            c_p = parse_ai_output(c_raw)
-
-            st.divider()
-            st.subheader("AI Audit")
-            cols = st.columns(3)
-            cols[0].markdown("**Gemini**"); cols[0].json(g_raw)
-            cols[1].markdown("**Grok**"); cols[1].json(k_raw)
-            cols[2].markdown("**ChatGPT**"); cols[2].json(c_raw)
-
-            high_count = sum(1 for p in [g_p, k_p, c_p] if p["verdict"] in ["ELITE", "HIGH_CONV"])
-
-            warning_text, _ = get_relevant_event_warning()
-
-            if high_count >= MIN_CONVICTION_FOR_ALERT:
-                p = g_p
-                entry = p.get("entry") or live_price
-                proposed_sl = p.get("sl")
-                sl_dist = abs(entry - proposed_sl) if proposed_sl else atr * 1.5
-                sl_dist = min(sl_dist, atr * MAX_SL_ATR_MULT)
-                sl = entry - sl_dist if "BULL" in p.get("direction", "") else entry + sl_dist
-                tp = p.get("tp") or (entry + atr*3 if "BULL" in p.get("direction", "") else entry - atr*3)
-
-                invalidated = check_opposing_invalidation(levels, p.get("direction", ""), entry, atr)
-                if invalidated:
-                    high_count -= 1
-
-                cash_risk = min(buffer * (st.session_state.risk_pct / 100), st.session_state.daily_limit or buffer)
-                risk_dist = abs(entry - sl) + SPREAD_BUFFER_POINTS + SLIPPAGE_BUFFER_POINTS
-                risk_per_lot = risk_dist * PIP_VALUE
-                lots = cash_risk / risk_per_lot if risk_per_lot > 0 else 0.01
-                lots = max(0.01, round(lots / 0.01) * 0.01)
-                actual_risk = lots * risk_per_lot
-
-                st.metric("Proposed Lots (strongest proposal, SL capped)", f"{lots:.2f}", f"Risk ~${actual_risk:.0f}")
-
-                if warning_text:
-                    st.warning(warning_text)
-
-            if high_count == 3:
-                st.success("3/3 Elite")
-            elif high_count == 2:
-                st.info("2/3 Conviction")
-            elif sum(1 for p in [g_p, k_p, c_p] if p["verdict"] == "SKIP") >= 2:
-                st.warning("Majority SKIP")
-            else:
-                st.markdown("Mixed – review carefully")
+            # Display AI raw outputs if needed (optional – comment out if too verbose)
+            # g_raw, k_raw, c_raw = get_ai_advice(...)  # would need to re-fetch data – skip for credit safety
 
         except Exception as e:
             st.error(f"Analysis failed: {str(e)}\nLikely data/API issue – retry or wait.")
