@@ -9,8 +9,6 @@ from twelvedata import TDClient
 import google.generativeai as genai
 from openai import OpenAI
 import requests
-import threading
-import schedule
 import os
 from bs4 import BeautifulSoup
 
@@ -18,12 +16,12 @@ from bs4 import BeautifulSoup
 SPREAD_BUFFER_POINTS = 0.30
 SLIPPAGE_BUFFER_POINTS = 0.20
 COMMISSION_PER_LOT_RT = 1.00
-PIP_VALUE = 100                  # $ per 1.00 move per standard lot
+PIP_VALUE = 100
 
 ALERT_COOLDOWN_MIN = 30
 MIN_CONVICTION_FOR_ALERT = 2
-MAX_SL_ATR_MULT = 2.2            # Cap SL distance to protect prop DD
-OPPOSING_FRACTAL_ATR_MULT = 0.8  # If opposing fractal closer than this → invalidate
+MAX_SL_ATR_MULT = 2.2
+OPPOSING_FRACTAL_ATR_MULT = 0.8
 
 DEFAULT_BALANCE = 5000.0
 DEFAULT_DAILY_LIMIT = 250.0
@@ -76,9 +74,9 @@ def send_telegram(message: str, priority: str = "normal"):
     except Exception as e:
         st.error(f"Telegram send failed: {e}")
 
-# ─── ECONOMIC CALENDAR SCRAPE (Investing.com) ────────────────────────────────
+# ─── ECONOMIC CALENDAR SCRAPE ────────────────────────────────────────────────
 @retry_api()
-@st.cache_data(ttl=900)  # 15 min cache
+@st.cache_data(ttl=1800)  # 30 min cache – events change slowly
 def fetch_upcoming_events():
     url = "https://www.investing.com/economic-calendar/"
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
@@ -120,7 +118,7 @@ def fetch_upcoming_events():
 
         return sorted(events, key=lambda x: x["time"])[:8]
     except Exception as e:
-        st.warning(f"Calendar scrape failed: {e}. Using no event data.")
+        st.warning(f"Calendar scrape failed: {e}. No event data.")
         return []
 
 def get_relevant_event_warning():
@@ -144,10 +142,10 @@ def get_relevant_event_warning():
 def send_event_reminder_if_needed():
     _, reminder_ev = get_relevant_event_warning()
     if reminder_ev:
-        msg = f"🚨 REMINDER: High-impact event approaching in \~{int(reminder_ev['minutes_away'])} min!\n{reminder_ev['name']} ({reminder_ev['currency']})\nConsider closing Gold positions / avoiding new entries."
+        msg = f"🚨 REMINDER: High-impact event in \~{int(reminder_ev['minutes_away'])} min!\n{reminder_ev['name']} ({reminder_ev['currency']})\nClose Gold / avoid new entries."
         send_telegram(msg, priority="high")
 
-# ─── FRACTAL LEVELS + INVALIDATION ───────────────────────────────────────────
+# ─── FRACTALS & INVALIDATION ─────────────────────────────────────────────────
 def get_fractal_levels(df, window=5, min_dist_factor=0.4):
     if df.empty:
         return []
@@ -190,17 +188,15 @@ def fetch_htf_data(interval):
     ts = ts.with_ema(time_period=200)
     return ts.as_pandas()
 
-@st.cache_data(ttl=180)  # increased slightly to reduce price calls
+@st.cache_data(ttl=180)
 @retry_api()
 def get_current_price():
     return float(td.price(symbol="XAU/USD").as_json()["price"])
 
-# ─── TWELVE DATA USAGE CHECK ─────────────────────────────────────────────────
+# ─── TD USAGE CHECK ──────────────────────────────────────────────────────────
 def get_td_usage():
     try:
-        resp = requests.get(
-            f"https://api.twelvedata.com/api_usage?apikey={st.secrets['TWELVE_DATA_KEY']}"
-        )
+        resp = requests.get(f"https://api.twelvedata.com/api_usage?apikey={st.secrets['TWELVE_DATA_KEY']}")
         return resp.json()
     except Exception as e:
         return {"error": str(e)}
@@ -302,7 +298,7 @@ def save_last_alert(time_val, key, proposal):
     except:
         pass
 
-# ─── ALERT CHECK (now manual only) ───────────────────────────────────────────
+# ─── CORE CHECK FUNCTION ─────────────────────────────────────────────────────
 def check_for_high_conviction_setup():
     last = load_last_alert()
     now_ts = time.time()
@@ -320,7 +316,7 @@ def check_for_high_conviction_setup():
             return
 
         live_price = get_current_price()
-        time.sleep(2)  # spread calls
+        time.sleep(2)
         ts_15m = fetch_15m_data()
         time.sleep(2)
         if ts_15m.empty:
@@ -425,26 +421,21 @@ def check_for_high_conviction_setup():
             save_last_alert(now_ts, key, proposal_data)
 
     except Exception as e:
-        st.error(f"Analysis failed: {str(e)}")
-
-# ─── BACKGROUND THREAD DISABLED ──────────────────────────────────────────────
-# The background checker is commented out to stop automatic credit usage
-# Uncomment only after upgrading plan or adding burst protection
-#
-# def run_background_checker():
-#     schedule.every(15).minutes.do(check_for_high_conviction_setup)
-#     while True:
-#         schedule.run_pending()
-#         time.sleep(1)
-#
-# if "checker_started" not in st.session_state:
-#     st.session_state.checker_started = True
-#     threading.Thread(target=run_background_checker, daemon=True).start()
+        st.error(f"Check failed: {str(e)}")
 
 # ─── STREAMLIT UI ────────────────────────────────────────────────────────────
 st.set_page_config(page_title="Gold Sentinel Pro", page_icon="🥇", layout="wide")
 st.title("🥇 Gold Sentinel – High Conviction Gold Entries")
-st.caption(f"Adaptive engine | Manual mode only (background disabled) | {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
+st.caption(f"Adaptive engine | Safe auto-check while page open | {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
+
+# Auto-check controls
+auto_enabled = st.checkbox("Enable auto-check while this page is open", value=True)
+auto_interval_min = st.slider("Check every (minutes)", 10, 60, 15, step=5)
+
+# Usage monitor
+if st.button("🔍 Check Twelve Data Usage (costs 1 credit)"):
+    usage = get_td_usage()
+    st.json(usage)
 
 if "analysis_done" not in st.session_state:
     st.session_state.analysis_done = False
@@ -453,14 +444,10 @@ if "analysis_done" not in st.session_state:
     st.session_state.floor = DEFAULT_FLOOR
     st.session_state.risk_pct = DEFAULT_RISK_PCT
     st.session_state.last_analysis = 0
-
-# Twelve Data Usage Monitor
-if st.button("🔍 Check Twelve Data Usage (costs 1 credit)"):
-    usage = get_td_usage()
-    st.json(usage)
+    st.session_state.last_check_time = 0  # for timer
 
 if not st.session_state.analysis_done:
-    st.header("Account Settings (RF Bronze 5K friendly)")
+    st.header("Account Settings")
     col1, col2 = st.columns(2)
     with col1:
         st.session_state.balance = st.number_input("Balance ($)", min_value=0.0, value=st.session_state.balance, format="%.2f")
@@ -470,7 +457,7 @@ if not st.session_state.analysis_done:
     st.session_state.floor = st.number_input("Floor ($)", value=st.session_state.floor, format="%.2f")
     st.session_state.risk_pct = st.slider("Risk % per trade", 5, 50, st.session_state.risk_pct, step=5)
 
-    if st.button("🚀 Analyze & Suggest", type="primary"):
+    if st.button("🚀 Analyze & Suggest (manual)", type="primary"):
         if st.session_state.balance <= 0:
             st.error("Valid balance required")
         elif time.time() - st.session_state.last_analysis < 60:
@@ -479,6 +466,11 @@ if not st.session_state.analysis_done:
             st.session_state.last_analysis = time.time()
             st.session_state.analysis_done = True
             st.rerun()
+
+    if st.button("📡 Manual Alert Check Now (\~4 credits)"):
+        with st.spinner("Running manual check..."):
+            check_for_high_conviction_setup()
+        st.success("Manual check done. See Telegram if setup found.")
 else:
     cols = st.columns(5)
     cols[0].metric("Balance", f"${st.session_state.balance:.2f}")
@@ -505,16 +497,23 @@ else:
     if utc_now.hour >= 21 and utc_now.hour < 23:
         st.warning("Late NY session — whipsaw risk ↑")
 
-    with st.spinner("Fetching data & auditing..."):
-        try:
-            check_for_high_conviction_setup()  # now called manually only
+    # ─── SAFE AUTO-CHECK TIMER ───────────────────────────────────────────────
+    CHECK_INTERVAL_SEC = auto_interval_min * 60
 
-            # Display AI raw outputs if needed (optional – comment out if too verbose)
-            # g_raw, k_raw, c_raw = get_ai_advice(...)  # would need to re-fetch data – skip for credit safety
+    if auto_enabled:
+        if "last_check_time" not in st.session_state:
+            st.session_state.last_check_time = 0
 
-        except Exception as e:
-            st.error(f"Analysis failed: {str(e)}\nLikely data/API issue – retry or wait.")
+        now = time.time()
+        if now - st.session_state.last_check_time >= CHECK_INTERVAL_SEC:
+            st.session_state.last_check_time = now
+            with st.status(f"Auto-checking... (next in \~{auto_interval_min} min)", expanded=False) as status:
+                check_for_high_conviction_setup()
+                status.update(label="Auto-check complete", state="complete")
+            st.rerun()
+    else:
+        st.info("Auto-check is off. Use manual button above.")
 
-    if st.button("Reset"):
+    if st.button("Reset to Settings"):
         st.session_state.analysis_done = False
         st.rerun()
