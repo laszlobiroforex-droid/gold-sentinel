@@ -136,6 +136,9 @@ Always provide concrete values for entry, SL, TP, RR, style and direction unless
 Even if the edge is only moderate, still propose something sensible rather than saying skip.
 Only use null for entry/sl/tp/rr if there is truly no reasonable trade at all.
 
+Always consider the stated balance amd the user defined accepted loss percentage in your response and propose a lot size as well.
+Use typical micro lot sizing where $1 price move equates to $1 equity move on a 0.01 lot.
+
 Respond **ONLY** with valid JSON. No fences, no markdown, no extra text:
 
 {{
