@@ -1,37 +1,33 @@
-Import streamlit as st
+import streamlit as st
 import pandas as pd
 import numpy as np
 import re
 import time
-import json
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from twelvedata import TDClient
 import google.generativeai as genai
 from openai import OpenAI
 import requests
 import threading
 import schedule
+import json
 import os
-from bs4 import BeautifulSoup
 
 # ─── CONFIG ──────────────────────────────────────────────────────────────────
 SPREAD_BUFFER_POINTS = 0.30
 SLIPPAGE_BUFFER_POINTS = 0.20
 COMMISSION_PER_LOT_RT = 1.00
-PIP_VALUE = 100                  # $ per 1.00 move per standard lot
+PIP_VALUE = 100
 
 ALERT_COOLDOWN_MIN = 30
-MIN_CONVICTION_FOR_ALERT = 2
-MAX_SL_ATR_MULT = 2.2            # Cap SL distance to protect prop DD
-OPPOSING_FRACTAL_ATR_MULT = 0.8  # If opposing fractal closer than this → invalidate
+MIN_CONVICTION_FOR_ALERT = 2     # 2 or 3 AIs saying ELITE/HIGH_CONV
 
+# ─── DEFAULT ACCOUNT VALUES ──────────────────────────────────────────────────
 DEFAULT_BALANCE = 5000.0
 DEFAULT_DAILY_LIMIT = 250.0
 DEFAULT_FLOOR = 4500.0
 DEFAULT_RISK_PCT = 25
-
-LAST_ALERT_FILE = "last_alert.json"
-EVENTS_CACHE_FILE = "events_cache.json"  # Persist scraped events briefly
+DEFAULT_MODE = "Standard (Swing – 15m + 1h alignment)"
 
 # ─── RETRY HELPER ────────────────────────────────────────────────────────────
 def retry_api(max_attempts=3, backoff=5):
@@ -41,9 +37,8 @@ def retry_api(max_attempts=3, backoff=5):
                 try:
                     return func(*args, **kwargs)
                 except Exception as e:
-                    st.error(f"Retry {attempt+1}/{max_attempts} failed: {str(e)}")
                     if attempt == max_attempts - 1:
-                        raise
+                        raise e
                     time.sleep(backoff * (attempt + 1))
             return None
         return wrapper
@@ -55,11 +50,15 @@ try:
     genai.configure(api_key=st.secrets["GEMINI_KEY"])
     gemini_model = genai.GenerativeModel('gemini-2.5-flash')
 
-    grok_client = OpenAI(api_key=st.secrets["GROK_API_KEY"], base_url="https://api.x.ai/v1")
+    grok_client = OpenAI(
+        api_key=st.secrets["GROK_API_KEY"],
+        base_url="https://api.x.ai/v1",
+    )
+
     openai_client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
 
 except Exception as e:
-    st.error(f"API setup failed: {e}")
+    st.error(f"Critical: API setup failed → {e}\nCheck Streamlit secrets.")
     st.stop()
 
 # ─── TELEGRAM SENDER ─────────────────────────────────────────────────────────
@@ -71,87 +70,16 @@ def send_telegram(message: str, priority: str = "normal"):
 
     emoji = "🟢 ELITE" if priority == "high" else "🔵 Conviction"
     text = f"{emoji} Gold Setup Alert\n\n{message}\n\n{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"
+    
     url = f"https://api.telegram.org/bot{token}/sendMessage"
+    payload = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
     try:
-        requests.post(url, json={"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}, timeout=8)
-    except Exception as e:
-        st.error(f"Telegram send failed: {e}")
+        requests.post(url, json=payload, timeout=8)
+    except:
+        pass
 
-# ─── ECONOMIC CALENDAR SCRAPE (Investing.com) ────────────────────────────────
-@retry_api()
-@st.cache_data(ttl=900)  # 15 min cache
-def fetch_upcoming_events():
-    url = "https://www.investing.com/economic-calendar/"
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-    try:
-        resp = requests.get(url, headers=headers, timeout=12)
-        resp.raise_for_status()
-        soup = BeautifulSoup(resp.text, "html.parser")
-
-        events = []
-        rows = soup.find_all("tr", class_="js-event-item")
-        now_utc = datetime.now(timezone.utc)
-
-        for row in rows:
-            time_str = row.find("td", class_="time").get_text(strip=True)
-            if "All Day" in time_str or not time_str:
-                continue
-            try:
-                event_time = datetime.strptime(time_str, "%b %d, %Y %H:%M").replace(tzinfo=timezone.utc)
-                # Adjust if no year/month → assume current or next
-                if event_time < now_utc - timedelta(days=1):
-                    event_time += timedelta(days=365)  # rough next year fallback
-            except:
-                continue
-
-            currency = row.find("td", class_="flagCur").get_text(strip=True)
-            impact = row.find("td", class_="sentiment").find_all("i", class_="grayFull")  # red = high
-            impact_level = 3 - len([i for i in impact if "gray" in i["class"]])  # 3 = high, 2=med, etc.
-
-            event_name = row.find("td", class_="event").get_text(strip=True)
-
-            if impact_level >= 2 and (currency in ["USD", "XAU", "ALL"] or any(kw in event_name.lower() for kw in ["fed", "cpi", "nfp", "payroll", "fomc", "rate", "inflation", "geopol"])):
-                events.append({
-                    "time": event_time,
-                    "name": event_name,
-                    "currency": currency,
-                    "impact": "High" if impact_level == 3 else "Medium",
-                    "minutes_away": (event_time - now_utc).total_seconds() / 60
-                })
-
-        return sorted(events, key=lambda x: x["time"])[:8]  # next 8 relevant
-    except Exception as e:
-        st.warning(f"Calendar scrape failed: {e}. Using no event data.")
-        return []
-
-def get_relevant_event_warning():
-    events = fetch_upcoming_events()
-    if not events:
-        return None, None
-
-    now = datetime.now(timezone.utc)
-    reminder_event = None
-    warning_text = ""
-
-    for ev in events:
-        mins = ev["minutes_away"]
-        if 15 <= mins <= 45:
-            reminder_event = ev
-        if 0 < mins <= 120:  # warn up to 2h ahead
-            warning_text += f"⚠️ {ev['impact']} event in ~{int(mins)} min: {ev['name']} ({ev['currency']})\n"
-
-    return warning_text.strip(), reminder_event
-
-def send_event_reminder_if_needed():
-    _, reminder_ev = get_relevant_event_warning()
-    if reminder_ev:
-        msg = f"🚨 REMINDER: High-impact event approaching in ~{int(reminder_ev['minutes_away'])} min!\n{reminder_ev['name']} ({reminder_ev['currency']})\nConsider closing Gold positions / avoiding new entries."
-        send_telegram(msg, priority="high")
-
-# ─── FRACTAL LEVELS + INVALIDATION ───────────────────────────────────────────
+# ─── FRACTAL LEVELS ──────────────────────────────────────────────────────────
 def get_fractal_levels(df, window=5, min_dist_factor=0.4):
-    if df.empty:
-        return []
     levels = []
     atr_approx = (df['high'] - df['low']).rolling(14).mean().iloc[-1] or 10.0
     for i in range(window, len(df) - window):
@@ -165,29 +93,30 @@ def get_fractal_levels(df, window=5, min_dist_factor=0.4):
                 levels.append(('SUP', price))
     return sorted(levels, key=lambda x: x[1], reverse=True)
 
-def check_opposing_invalidation(levels, direction, entry, atr):
-    threshold = atr * OPPOSING_FRACTAL_ATR_MULT
-    if "BULL" in direction:
-        close_res = [p for t, p in levels if t == 'RES' and entry < p < entry + threshold]
-        return bool(close_res)  # True = invalid (resistance too close)
-    elif "BEAR" in direction:
-        close_sup = [p for t, p in levels if t == 'SUP' and entry - threshold < p < entry]
-        return bool(close_sup)
-    return False
-
-# ─── DATA FETCH ──────────────────────────────────────────────────────────────
+# ─── FIXED DATA FETCH ────────────────────────────────────────────────────────
 @st.cache_data(ttl=300)
 @retry_api()
 def fetch_15m_data():
-    ts = td.time_series(symbol="XAU/USD", interval="15min", outputsize=200)
-    ts = ts.with_rsi().with_ema(time_period=200).with_ema(time_period=50).with_atr(time_period=14)
+    ts = td.time_series(
+        symbol="XAU/USD",
+        interval="15min",
+        outputsize=500
+    )
+    ts = ts.with_rsi()                     # default period=14
+    ts = ts.with_ema(time_period=200)
+    ts = ts.with_ema(time_period=50)
+    ts = ts.with_atr(time_period=14)
     return ts.as_pandas()
 
 @st.cache_data(ttl=300)
 @retry_api()
 def fetch_htf_data(interval):
-    out_size = 200 if interval == "5min" else 100
-    ts = td.time_series(symbol="XAU/USD", interval=interval, outputsize=out_size)
+    out_size = 500 if interval == "5min" else 200
+    ts = td.time_series(
+        symbol="XAU/USD",
+        interval=interval,
+        outputsize=out_size
+    )
     ts = ts.with_ema(time_period=200)
     return ts.as_pandas()
 
@@ -198,154 +127,136 @@ def get_current_price():
 
 # ─── AI ADVICE ───────────────────────────────────────────────────────────────
 @retry_api()
-def get_ai_advice(market, setup, levels, buffer, aligned_1h, aligned_5m):
+def get_ai_advice(market, setup, levels, buffer, mode):
     levels_str = ", ".join([f"{l[0]}@{l[1]}" for l in levels[:6]]) if levels else "No clear levels"
     current_price = market['price']
+    prompt = f"""
+You are a high-conviction gold trading auditor for any account size.
+Mode: {mode} ({'standard swing (15m + 1h)' if mode == 'Standard' else 'fast scalp (15m + 5m)'}).
+Aggressive risk is user's choice — size is handled externally, do NOT suggest lots multiplier or position size changes.
+Focus on math, pullback quality, structural confluence, risk/reward.
+IMPORTANT: For buys, SL must be BELOW entry. For sells, SL must be ABOVE entry.
 
-    base_prompt = f"""
-You are a high-conviction gold trading auditor.
-Evaluate ANY high-edge pattern: continuation pullbacks (scalp or swing), momentum breakouts, reversals at key levels, range mean-reversion, etc.
-Prioritize RR ≥ 1.8, strong confluence, clean risk.
-Skip if low quality, chasing, or gamble.
+Current UTC time: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}
+NY session close \~22:00 UTC — factor in thinning liquidity and whipsaw risk after 21:30 UTC.
+If any high-impact news likely within ±30 min, prefer to wait unless setup is exceptionally strong.
 
-Current UTC: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')} (watch whipsaw after 21:30 UTC)
-Market: ${current_price:.2f}, RSI {market['rsi']:.1f}
-Trend: 15m vs 1H EMA200: {'agree' if aligned_1h else 'disagree'}, 15m vs 5M EMA200: {'agree' if aligned_5m else 'disagree'}
+Current market price: ${current_price:.2f}
+Buffer left: ${buffer:.2f}
+Market: Price ${current_price:.2f}, RSI {market['rsi']:.1f}
+Original setup: {setup['type']} at ${setup['entry']:.2f}, SL distance ${setup['sl_distance']:.2f}, ATR ${setup['atr']:.2f}, risk % {setup['risk_pct']:.0f}%
 Fractals: {levels_str}
-Setup context: entry ~${setup['entry']:.2f}, ATR ${setup['atr']:.2f}, risk buffer ${buffer:.2f}
 
-Respond ONLY with valid JSON:
-{{
-  "verdict": "ELITE" | "HIGH_CONV" | "LOW_EDGE" | "GAMBLE" | "SKIP",
-  "reason": "short explanation",
-  "entry": number or null,
-  "sl": number or null,
-  "tp": number or null,
-  "rr": number or null,
-  "style": "SCALP" | "SWING" | "BREAKOUT" | "REVERSAL" | "RANGE" | "NONE",
-  "direction": "BULLISH" | "BEARISH" | "NEUTRAL",
-  "reasoning": "1-2 sentences"
-}}
+Be STRICTLY consistent:
+- If original setup is low-edge, obsolete, missed, gamble, or chasing, your proposal MUST NOT re-use or slightly adjust the original entry price.
+- Any proposal MUST respect current market price ${current_price:.2f} — never suggest entries significantly below current price in bullish mode or above in bearish mode unless clear reversal evidence exists.
+- Direction must match detected bias unless verdict explicitly states "reversal".
+- Only propose changes that meaningfully improve the setup (e.g. higher entry in continuation, different SL/TP, or skip).
+- If no good alternative exists, clearly recommend skipping.
+
+Respond ONLY in this exact structured format. Do not add extra text.
+
+VERDICT: ELITE | HIGH_CONV | LOW_EDGE | GAMBLE | SKIP
+REASON: [short explanation, 1-2 sentences]
+PROPOSAL: [entry price] | [SL price] | [TP price] | [RR ratio e.g. 2.5] | [direction: BULLISH/BEARISH/NEUTRAL] | [reasoning, 1-2 sentences]
+or
+PROPOSAL: NONE
 """
 
     try:
-        g_out = gemini_model.generate_content(base_prompt).text.strip()
+        g_out = gemini_model.generate_content(prompt).text.strip()
     except:
-        g_out = '{"verdict":"SKIP","reason":"Gemini offline"}'
+        g_out = "VERDICT: SKIP\nREASON: Gemini Offline.\nPROPOSAL: NONE"
 
     try:
         r = grok_client.chat.completions.create(
             model="grok-4",
-            messages=[{"role": "user", "content": base_prompt + "\nBe concise and factual."}],
-            max_tokens=300,
-            temperature=0.4
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=220
         )
         k_out = r.choices[0].message.content.strip()
     except:
-        k_out = '{"verdict":"SKIP","reason":"Grok error"}'
+        k_out = "VERDICT: SKIP\nREASON: Grok Error.\nPROPOSAL: NONE"
 
     try:
         response = openai_client.chat.completions.create(
             model="gpt-4o-mini",
-            messages=[{"role": "user", "content": base_prompt + "\nOutput strict JSON only, no extra text."}],
-            max_tokens=300,
-            temperature=0.5
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=220,
+            temperature=0.65
         )
         c_out = response.choices[0].message.content.strip()
     except:
-        c_out = '{"verdict":"SKIP","reason":"ChatGPT error"}'
+        c_out = "VERDICT: SKIP\nREASON: ChatGPT Error.\nPROPOSAL: NONE"
 
-    return g_raw, k_out, c_out
+    return g_out, k_out, c_out
 
 # ─── PARSE AI OUTPUT ─────────────────────────────────────────────────────────
 def parse_ai_output(text):
-    try:
-        cleaned = text.strip('```json\n').strip('```').strip()
-        data = json.loads(cleaned)
-        return {
-            "verdict": data.get("verdict", "UNKNOWN").upper(),
-            "reason": data.get("reason", ""),
-            "entry": data.get("entry"),
-            "sl": data.get("sl"),
-            "tp": data.get("tp"),
-            "rr": data.get("rr"),
-            "style": data.get("style", "NONE").upper(),
-            "direction": data.get("direction", "NEUTRAL").upper(),
-            "reasoning": data.get("reasoning", "")
-        }
-    except:
-        return {"verdict": "UNKNOWN", "reason": "Parsing failed", "proposal": "NONE"}
+    verdict = "UNKNOWN"
+    reason = ""
+    proposal = "NONE"
+    entry = sl = tp = rr = direction = None
 
-# ─── LAST ALERT PERSISTENCE ──────────────────────────────────────────────────
-def load_last_alert():
-    if os.path.exists(LAST_ALERT_FILE):
-        try:
-            with open(LAST_ALERT_FILE, "r") as f:
-                return json.load(f)
-        except:
-            return {"time": 0, "key": None, "proposal": {}}
-    return {"time": 0, "key": None, "proposal": {}}
+    v_match = re.search(r"VERDICT:\s*(\w+)", text, re.IGNORECASE)
+    if v_match:
+        verdict = v_match.group(1).upper()
 
-def save_last_alert(time_val, key, proposal):
-    try:
-        with open(LAST_ALERT_FILE, "w") as f:
-            json.dump({"time": time_val, "key": key, "proposal": proposal}, f)
-    except:
-        pass
+    r_match = re.search(r"REASON:\s*(.+?)(?=PROPOSAL:|$)", text, re.DOTALL | re.IGNORECASE)
+    if r_match:
+        reason = r_match.group(1).strip()
+
+    p_match = re.search(r"PROPOSAL:\s*(.+)", text, re.DOTALL | re.IGNORECASE)
+    if p_match:
+        proposal_raw = p_match.group(1).strip()
+        if proposal_raw.upper() != "NONE":
+            parts = [p.strip() for p in proposal_raw.split("|")]
+            if len(parts) >= 5:
+                try:
+                    entry = float(parts[0])
+                    sl = float(parts[1])
+                    tp = float(parts[2])
+                    rr = float(parts[3])
+                    direction = parts[4].strip().upper()
+                    proposal = "PROPOSAL"
+                except:
+                    pass
+
+    return {
+        "verdict": verdict,
+        "reason": reason,
+        "proposal": proposal,
+        "entry": entry,
+        "sl": sl,
+        "tp": tp,
+        "rr": rr,
+        "direction": direction
+    }
 
 # ─── ALERT CHECK ─────────────────────────────────────────────────────────────
 def check_for_high_conviction_setup():
-    last = load_last_alert()
-    now_ts = time.time()
-    if now_ts - last["time"] < ALERT_COOLDOWN_MIN * 60:
+    if "last_alert_time" not in st.session_state:
+        st.session_state.last_alert_time = 0
+    if "last_alerted_key" not in st.session_state:
+        st.session_state.last_alerted_key = None
+
+    now = time.time()
+    if now - st.session_state.last_alert_time < ALERT_COOLDOWN_MIN * 60:
         return
 
     try:
-        # Event checks first
-        warning_text, reminder_ev = get_relevant_event_warning()
-        if reminder_ev:
-            send_event_reminder_if_needed()
-
-        # Pause if event < 60 min away
-        events = fetch_upcoming_events()
-        imminent = any(0 < ev["minutes_away"] < 60 for ev in events if ev["impact"] == "High")
-        if imminent:
-            return  # skip alert generation
-
         live_price = get_current_price()
         ts_15m = fetch_15m_data()
-        if ts_15m.empty:
-            return
-
         latest_15m = ts_15m.iloc[-1]
         rsi = latest_15m.get('rsi', 50.0)
         atr = latest_15m.get('atr', 10.0)
 
         market = {"price": live_price, "rsi": rsi}
-        setup = {"entry": live_price, "sl_distance": atr*1.5, "atr": atr, "risk_pct": DEFAULT_RISK_PCT}
+        setup = {"type": "UNKNOWN", "entry": live_price, "sl_distance": atr*1.5, "atr": atr, "risk_pct": DEFAULT_RISK_PCT}
         levels = get_fractal_levels(ts_15m)
         buffer = DEFAULT_BALANCE - DEFAULT_FLOOR
 
-        try:
-            balance = st.session_state.get("balance", DEFAULT_BALANCE)
-            floor = st.session_state.get("floor", DEFAULT_FLOOR)
-            daily_limit = st.session_state.get("daily_limit", None)
-            risk_pct = st.session_state.get("risk_pct", DEFAULT_RISK_PCT)
-            buffer = balance - floor
-        except:
-            pass
-
-        ts_1h = fetch_htf_data("1h")
-        ts_5m = fetch_htf_data("5min")
-
-        ema200_15m = latest_15m.get('ema_200', live_price)
-        ema200_1h = ts_1h.iloc[-1].get('ema_200', live_price) if not ts_1h.empty else live_price
-        ema200_5m = ts_5m.iloc[-1].get('ema_200', live_price) if not ts_5m.empty else live_price
-
-        aligned_1h = (live_price > ema200_15m) == (live_price > ema200_1h)
-        aligned_5m = (live_price > ema200_15m) == (live_price > ema200_5m)
-
-        g_raw, k_raw, c_raw = get_ai_advice(market, setup, levels, buffer, aligned_1h, aligned_5m)
+        g_raw, k_raw, c_raw = get_ai_advice(market, setup, levels, buffer, DEFAULT_MODE)
         g_p = parse_ai_output(g_raw)
         k_p = parse_ai_output(k_raw)
         c_p = parse_ai_output(c_raw)
@@ -353,225 +264,218 @@ def check_for_high_conviction_setup():
         high_count = sum(1 for p in [g_p, k_p, c_p] if p["verdict"] in ["ELITE", "HIGH_CONV"])
 
         if high_count >= MIN_CONVICTION_FOR_ALERT:
-            p = g_p  # Gemini primary
-            direction = p.get("direction", "NEUTRAL")
-            style = p.get("style", "NONE")
-            entry = p.get("entry") or live_price
-            proposed_sl = p.get("sl")
-            proposed_tp = p.get("tp")
-            rr = p.get("rr") or 2.0
+            direction = g_p.get("direction") or "UNKNOWN"
+            entry = g_p.get("entry") or live_price
+            sl = g_p.get("sl") or (entry - atr*1.5 if direction.startswith("BULL") else entry + atr*1.5)
+            tp = g_p.get("tp") or (entry + atr*3 if direction.startswith("BULL") else entry - atr*3)
+            rr = g_p.get("rr") or 2.0
 
-            # Apply SL cap
-            default_sl_dist = atr * 1.5
-            if proposed_sl:
-                sl_dist = abs(entry - proposed_sl)
-                sl_dist = min(sl_dist, atr * MAX_SL_ATR_MULT)
-                sl = entry - sl_dist if "BULL" in direction else entry + sl_dist
-            else:
-                sl = entry - default_sl_dist if "BULL" in direction else entry + default_sl_dist
-
-            tp = proposed_tp or (entry + atr*3 if "BULL" in direction else entry - atr*3)
-
-            # Opposing invalidation check
-            invalidated = check_opposing_invalidation(levels, direction, entry, atr)
-            if invalidated:
-                high_count -= 1  # downgrade
-                if high_count < MIN_CONVICTION_FOR_ALERT:
-                    return
-
-            # Lot sizing
-            cash_risk = min(buffer * (risk_pct / 100), daily_limit or buffer)
-            risk_dist = abs(entry - sl) + SPREAD_BUFFER_POINTS + SLIPPAGE_BUFFER_POINTS
-            risk_per_lot = risk_dist * PIP_VALUE
-            lots = cash_risk / risk_per_lot if risk_per_lot > 0 else 0.01
-            lots = max(0.01, round(lots / 0.01) * 0.01)
-            actual_risk = lots * risk_per_lot
-
-            key = f"{style}_{direction}_{entry:.2f}_{sl:.2f}"
-            if key == last["key"]:
+            key = f"{direction}_{entry:.2f}_{sl:.2f}"
+            if st.session_state.last_alerted_key == key:
                 return
 
-            event_warning = f"\n\n{warning_text}" if warning_text else ""
             msg = (
-                f"**High Conviction Setup!** ({high_count}/3)\n"
-                f"Style: {style}\nDirection: {direction}\n"
-                f"Entry: ${entry:.2f}\nSL: ${sl:.2f}\nTP: ${tp:.2f} (R:R ~1:{rr:.1f})\n"
-                f"**Proposed lots: {lots:.2f}** (risk ~${actual_risk:.0f})\n"
-                f"Price: ${live_price:.2f} | RSI {rsi:.1f}{event_warning}"
+                f"**High Conviction Setup!** ({high_count}/3 AIs)\n"
+                f"Direction: {direction}\n"
+                f"Entry: ${entry:.2f}\n"
+                f"SL: ${sl:.2f}\n"
+                f"TP: ${tp:.2f}   (R:R \~1:{rr:.1f})\n"
+                f"Current price: ${live_price:.2f} | RSI {rsi:.1f}"
             )
             priority = "high" if high_count == 3 else "normal"
             send_telegram(msg, priority)
 
-            proposal_data = {
-                "time": datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC'),
-                "style": style,
-                "direction": direction,
-                "entry": entry,
-                "sl": sl,
-                "tp": tp,
-                "rr": rr,
-                "lots": lots,
-                "risk": actual_risk,
-                "event_warning": warning_text
-            }
-            save_last_alert(now_ts, key, proposal_data)
+            st.session_state.last_alert_time = now
+            st.session_state.last_alerted_key = key
 
-    except Exception as e:
-        st.error(f"Background alert failed: {str(e)}")
+    except Exception:
+        pass
 
 # ─── BACKGROUND THREAD ───────────────────────────────────────────────────────
 def run_background_checker():
-    schedule.every(15).minutes.do(check_for_high_conviction_setup)
+    schedule.every(5).minutes.do(check_for_high_conviction_setup)
     while True:
         schedule.run_pending()
         time.sleep(1)
 
 if "checker_started" not in st.session_state:
     st.session_state.checker_started = True
-    threading.Thread(target=run_background_checker, daemon=True).start()
+    t = threading.Thread(target=run_background_checker, daemon=True)
+    t.start()
 
 # ─── STREAMLIT UI ────────────────────────────────────────────────────────────
 st.set_page_config(page_title="Gold Sentinel Pro", page_icon="🥇", layout="wide")
 st.title("🥇 Gold Sentinel – High Conviction Gold Entries")
-st.caption(f"Adaptive engine | Background every 15 min | {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
+st.caption(f"Adaptive pullback engine | {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
 
+# Session state defaults
 if "analysis_done" not in st.session_state:
     st.session_state.analysis_done = False
     st.session_state.balance = DEFAULT_BALANCE
     st.session_state.daily_limit = DEFAULT_DAILY_LIMIT
     st.session_state.floor = DEFAULT_FLOOR
     st.session_state.risk_pct = DEFAULT_RISK_PCT
+    st.session_state.mode = DEFAULT_MODE
     st.session_state.last_analysis = 0
 
+# ─── INPUTS ──────────────────────────────────────────────────────────────────
 if not st.session_state.analysis_done:
-    st.header("Account Settings (RF Bronze 5K friendly)")
+    st.header("Account Settings")
     col1, col2 = st.columns(2)
     with col1:
-        st.session_state.balance = st.number_input("Balance ($)", min_value=0.0, value=st.session_state.balance, format="%.2f")
+        st.session_state.balance = st.number_input(
+            "Current Balance ($)", min_value=0.0, value=st.session_state.balance,
+            format="%.2f"
+        )
     with col2:
-        st.session_state.daily_limit = st.number_input("Daily Limit ($)", min_value=0.0, value=st.session_state.daily_limit or 0.0, format="%.2f")
+        st.session_state.daily_limit = st.number_input(
+            "Daily Drawdown Limit ($)", min_value=0.0, value=st.session_state.daily_limit or 0.0,
+            format="%.2f", help="Set 0 for no daily limit"
+        )
 
-    st.session_state.floor = st.number_input("Floor ($)", value=st.session_state.floor, format="%.2f")
-    st.session_state.risk_pct = st.slider("Risk % per trade", 5, 50, st.session_state.risk_pct, step=5)
+    st.session_state.floor = st.number_input(
+        "Survival Floor / Max DD ($)", value=st.session_state.floor, format="%.2f"
+    )
 
-    if st.button("🚀 Analyze & Suggest", type="primary"):
+    st.session_state.risk_pct = st.slider(
+        "Risk % of Available Buffer", 5, 50, st.session_state.risk_pct, step=5
+    )
+
+    st.session_state.mode = st.radio(
+        "Analysis Mode",
+        ["Standard (Swing – 15m + 1h alignment)", "Scalp (Fast – 15m + 5m alignment)"],
+        index=0 if st.session_state.mode.startswith("Standard") else 1
+    )
+
+    if st.button("🚀 Analyze & Suggest", type="primary", use_container_width=True):
         if st.session_state.balance <= 0:
-            st.error("Valid balance required")
+            st.error("Enter valid balance > 0")
         elif time.time() - st.session_state.last_analysis < 60:
-            st.warning("Wait 60s")
+            st.warning("Wait 60s between analyses")
         else:
             st.session_state.last_analysis = time.time()
             st.session_state.analysis_done = True
             st.rerun()
+
 else:
+    st.info("Analysis locked — using your settings:")
     cols = st.columns(5)
     cols[0].metric("Balance", f"${st.session_state.balance:.2f}")
-    cols[1].metric("Daily Limit", f"${st.session_state.daily_limit:.2f}" if st.session_state.daily_limit else "Unlimited")
+    cols[1].metric("Daily Limit", f"${st.session_state.daily_limit:.2f}" if st.session_state.daily_limit else "No limit")
     cols[2].metric("Floor", f"${st.session_state.floor:.2f}")
     cols[3].metric("Risk %", f"{st.session_state.risk_pct}%")
-
-    # Last Alert Summary Card
-    last = load_last_alert()
-    if last.get("proposal"):
-        p = last["proposal"]
-        with st.expander("**Last High-Conviction Alert**", expanded=True):
-            st.markdown(f"**Time:** {p.get('time', 'unknown')}")
-            st.markdown(f"**Style:** {p.get('style')} | **Direction:** {p.get('direction')}")
-            col1, col2 = st.columns(2)
-            col1.metric("Entry", f"${p.get('entry', 0):.2f}")
-            col2.metric("SL / TP", f"${p.get('sl', 0):.2f} → ${p.get('tp', 0):.2f}")
-            st.metric("Proposed Lots", f"{p.get('lots', 0.01):.2f}", f"Risk ~${p.get('risk', 0):.0f}")
-            st.caption(f"R:R ~1:{p.get('rr', '?.1f')}")
-            if p.get("event_warning"):
-                st.warning(p["event_warning"])
+    cols[4].metric("Mode", st.session_state.mode.split(" – ")[0])
 
     utc_now = datetime.now(timezone.utc)
     if utc_now.hour >= 21 and utc_now.hour < 23:
-        st.warning("Late NY session — whipsaw risk ↑")
+        st.warning("Late NY session — higher whipsaw risk after \~21:30 UTC")
 
-    with st.spinner("Fetching data, calendar & auditing..."):
+    with st.spinner("Running triple AI audit first..."):
         try:
             live_price = get_current_price()
             ts_15m = fetch_15m_data()
-            if ts_15m.empty:
-                raise ValueError("15m data empty")
-
             latest_15m = ts_15m.iloc[-1]
             rsi = latest_15m.get('rsi', 50.0)
-            atr = latest_15m.get('atr', 10.0)
-
-            ts_1h = fetch_htf_data("1h")
-            ts_5m = fetch_htf_data("5min")
-
-            ema200_15m = latest_15m.get('ema_200', live_price)
-            ema200_1h = ts_1h.iloc[-1].get('ema_200', live_price) if not ts_1h.empty else live_price
-            ema200_5m = ts_5m.iloc[-1].get('ema_200', live_price) if not ts_5m.empty else live_price
-
-            aligned_1h = (live_price > ema200_15m) == (live_price > ema200_1h)
-            aligned_5m = (live_price > ema200_15m) == (live_price > ema200_5m)
+            atr = latest_15m.get('atr', 10.0) or 10.0
 
             market = {"price": live_price, "rsi": rsi}
             levels = get_fractal_levels(ts_15m)
             buffer = st.session_state.balance - st.session_state.floor
 
-            setup = {"entry": live_price, "sl_distance": atr*1.5, "atr": atr, "risk_pct": st.session_state.risk_pct}
+            setup_placeholder = {
+                "type": "PULLBACK",
+                "entry": live_price,
+                "sl_distance": atr * 1.5,
+                "atr": atr,
+                "risk_pct": st.session_state.risk_pct
+            }
 
-            g_raw, k_raw, c_raw = get_ai_advice(market, setup, levels, buffer, aligned_1h, aligned_5m)
+            g_raw, k_raw, c_raw = get_ai_advice(
+                market, setup_placeholder, levels, buffer, st.session_state.mode
+            )
 
-            g_p = parse_ai_output(g_raw)
-            k_p = parse_ai_output(k_raw)
-            c_p = parse_ai_output(c_raw)
+            g_parsed = parse_ai_output(g_raw)
+            k_parsed = parse_ai_output(k_raw)
+            c_parsed = parse_ai_output(c_raw)
 
             st.divider()
-            st.subheader("AI Audit")
-            cols = st.columns(3)
-            cols[0].markdown("**Gemini**"); cols[0].json(g_raw)
-            cols[1].markdown("**Grok**"); cols[1].json(k_raw)
-            cols[2].markdown("**ChatGPT**"); cols[2].json(c_raw)
+            st.subheader("Triple AI Opinions (primary filter)")
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.markdown("**Gemini**")
+                st.info(g_raw)
+            with col2:
+                st.markdown("**Grok**")
+                st.info(k_raw)
+            with col3:
+                st.markdown("**ChatGPT**")
+                st.info(c_raw)
 
-            high_count = sum(1 for p in [g_p, k_p, c_p] if p["verdict"] in ["ELITE", "HIGH_CONV"])
+            parsed_verdicts = [g_parsed["verdict"], k_parsed["verdict"], c_parsed["verdict"]]
+            elite_high_count = sum(1 for v in parsed_verdicts if v in ["ELITE", "HIGH_CONV"])
+            skip_count = sum(1 for v in parsed_verdicts if v == "SKIP")
 
-            warning_text, _ = get_relevant_event_warning()
-
-            if high_count >= MIN_CONVICTION_FOR_ALERT:
-                p = g_p
-                entry = p.get("entry") or live_price
-                proposed_sl = p.get("sl")
-                sl_dist = abs(entry - proposed_sl) if proposed_sl else atr * 1.5
-                sl_dist = min(sl_dist, atr * MAX_SL_ATR_MULT)
-                sl = entry - sl_dist if "BULL" in p.get("direction", "") else entry + sl_dist
-                tp = p.get("tp") or (entry + atr*3 if "BULL" in p.get("direction", "") else entry - atr*3)
-
-                invalidated = check_opposing_invalidation(levels, p.get("direction", ""), entry, atr)
-                if invalidated:
-                    high_count -= 1
-
-                cash_risk = min(buffer * (st.session_state.risk_pct / 100), st.session_state.daily_limit or buffer)
-                risk_dist = abs(entry - sl) + SPREAD_BUFFER_POINTS + SLIPPAGE_BUFFER_POINTS
-                risk_per_lot = risk_dist * PIP_VALUE
-                lots = cash_risk / risk_per_lot if risk_per_lot > 0 else 0.01
-                lots = max(0.01, round(lots / 0.01) * 0.01)
-                actual_risk = lots * risk_per_lot
-
-                st.metric("Proposed Lots (strongest proposal, SL capped)", f"{lots:.2f}", f"Risk ~${actual_risk:.0f}")
-
-                if warning_text:
-                    st.warning(warning_text)
-
-            if high_count == 3:
-                st.success("3/3 Elite")
-            elif high_count == 2:
-                st.info("2/3 Conviction")
-            elif sum(1 for p in [g_p, k_p, c_p] if p["verdict"] == "SKIP") >= 2:
-                st.warning("Majority SKIP")
+            if elite_high_count == 3:
+                st.success("3/3 High Conviction – Very strong signal")
+            elif elite_high_count == 2:
+                st.info("2/3 High Conviction – Reasonable edge")
+            elif skip_count >= 2:
+                st.warning(f"{skip_count}/3 Skip votes – Proceed with caution")
             else:
-                st.markdown("Mixed – review carefully")
+                st.markdown("Mixed AI views – review carefully")
 
-        except Exception as e:
-            st.error(f"Analysis failed: {str(e)}\nLikely data/API issue – retry or wait.")
+            # ── Your original logic (secondary) ─────────────────────────────────
+            st.divider()
+            st.subheader("Your Structured Setup (secondary check)")
+            try:
+                interval = "1h" if st.session_state.mode.startswith("Standard") else "5min"
+                ts_htf = fetch_htf_data(interval)
 
-    if st.button("Reset"):
-        st.session_state.analysis_done = False
-        st.rerun()
+                latest_htf = ts_htf.iloc[-1]
+                ema_cols_15m = sorted([c for c in ts_15m.columns if 'ema' in c.lower()])
+                ema200_15m = latest_15m[ema_cols_15m[0]] if ema_cols_15m else live_price
+                ema50_15m  = latest_15m[ema_cols_15m[1]] if len(ema_cols_15m) >= 2 else live_price
 
-How about now? With previous scores please.
+                ema_cols_htf = [c for c in ts_htf.columns if 'ema' in c.lower()]
+                ema200_htf = latest_htf[sorted(ema_cols_htf)[0]] if ema_cols_htf else live_price
+
+                aligned = (live_price > ema200_15m and live_price > ema200_htf) or \
+                          (live_price < ema200_15m and live_price < ema200_htf)
+
+                if not aligned:
+                    st.warning("Trend misalignment between 15m and HTF EMA200 → no high-conviction continuation trade recommended")
+                else:
+                    bias = "BULLISH" if live_price > ema200_15m else "BEARISH"
+
+                    resistances = sorted([l[1] for l in levels if l[0] == 'RES' and l[1] > live_price])
+                    supports    = sorted([l[1] for l in levels if l[0] == 'SUP' and l[1] < live_price], reverse=True)
+
+                    sl_dist = round(atr * 1.5, 2)
+                    min_sl_distance = atr * 0.4
+
+                    if bias == "BULLISH":
+                        original_entry = ema50_15m if (live_price - ema50_15m) > (atr * 0.5) else live_price
+                        valid_sup = [s for s in supports if s < original_entry]
+                        candidate_sl = valid_sup[0] - (0.3 * atr) if valid_sup else original_entry - sl_dist
+                        original_sl = min(candidate_sl, original_entry - min_sl_distance)
+                        original_tp = resistances[0] if resistances else original_entry + (sl_dist * 2.5)
+                        original_action = "BUY AT MARKET" if original_entry == live_price else "BUY LIMIT ORDER"
+                    else:
+                        original_entry = ema50_15m if (ema50_15m - live_price) > (atr * 0.5) else live_price
+                        valid_res = [r for r in resistances if r > original_entry]
+                        candidate_sl = valid_res[0] + (0.3 * atr) if valid_res else original_entry + sl_dist
+                        original_sl = max(candidate_sl, original_entry + min_sl_distance)
+                        original_tp = supports[0] if supports else original_entry - (sl_dist * 2.5)
+                        original_action = "SELL AT MARKET" if original_entry == live_price else "SELL LIMIT ORDER"
+
+                    cash_risk = min(buffer * (st.session_state.risk_pct / 100), st.session_state.daily_limit or buffer)
+
+                    proposals = [p for p in [g_parsed, k_parsed, c_parsed] if p["proposal"] != "NONE" and p["entry"] is not None]
+                    final_entry = original_entry
+                    final_sl = original_sl
+                    final_tp = original_tp
+                    override_applied = False
+
+                    if len(proposals) >= 2:
+                        entries = [p["entry"] for p in proposals]
+                        directions = [p["direct
