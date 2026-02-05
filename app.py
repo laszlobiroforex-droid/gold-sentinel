@@ -4,22 +4,43 @@ from datetime import datetime, timezone
 from twelvedata import TDClient
 import google.generativeai as genai
 import json
+import sys
 
 # ─────────────────────────────────────────────────────────────
-# CONFIG
+# PAGE CONFIG (MUST BE FIRST STREAMLIT CALL)
 # ─────────────────────────────────────────────────────────────
-SYMBOL = "XAU/USD"
-INTERVAL = "5min"
-CANDLE_LIMIT = 300
+st.set_page_config(
+    page_title="Gold Sentinel",
+    page_icon="🥇",
+    layout="wide"
+)
 
-EMA_FAST = 50
-EMA_SLOW = 200
-ATR_PERIOD = 14
+st.title("🥇 Gold Sentinel")
 
+# ─────────────────────────────────────────────────────────────
+# MODE
+# ─────────────────────────────────────────────────────────────
 MODE = st.sidebar.selectbox("Mode", ["PROP / FUNDED", "GROWTH"])
 
-TD_API_KEY = st.secrets["TWELVEDATA_API_KEY"]
-GEMINI_API_KEY = st.secrets["GEMINI_API_KEY"]
+# ─────────────────────────────────────────────────────────────
+# SECRETS (SAFE ACCESS)
+# ─────────────────────────────────────────────────────────────
+TD_API_KEY = st.secrets.get("TWELVE_DATA_KEY")
+GEMINI_API_KEY = st.secrets.get("GEMINI_API_KEY")
+
+missing = []
+if not TD_API_KEY:
+    missing.append("TWELVE_DATA_KEY")
+if not GEMINI_API_KEY:
+    missing.append("GEMINI_API_KEY")
+
+if missing:
+    st.error(
+        "Missing Streamlit secrets:\n\n"
+        + "\n".join(f"- {m}" for m in missing)
+        + "\n\nGo to **Settings → Secrets** and add them."
+    )
+    st.stop()
 
 # ─────────────────────────────────────────────────────────────
 # CLIENTS
@@ -28,7 +49,17 @@ td = TDClient(apikey=TD_API_KEY)
 genai.configure(api_key=GEMINI_API_KEY)
 
 # ─────────────────────────────────────────────────────────────
-# HARD RESET
+# CONFIG
+# ─────────────────────────────────────────────────────────────
+SYMBOL = "XAU/USD"
+INTERVAL = "5min"
+CANDLE_LIMIT = 300
+EMA_FAST = 50
+EMA_SLOW = 200
+ATR_PERIOD = 14
+
+# ─────────────────────────────────────────────────────────────
+# RESET
 # ─────────────────────────────────────────────────────────────
 if st.sidebar.button("🔄 FORCE FULL RESET"):
     st.cache_data.clear()
@@ -73,7 +104,7 @@ df["atr"] = tr.rolling(ATR_PERIOD).mean()
 latest = df.iloc[-1]
 
 # ─────────────────────────────────────────────────────────────
-# TREND (NO TERNARY, NO PARENS)
+# TREND (EXPLICIT)
 # ─────────────────────────────────────────────────────────────
 if latest.ema_50 > latest.ema_200:
     trend = "BULLISH"
@@ -83,19 +114,20 @@ else:
     trend = "RANGE"
 
 # ─────────────────────────────────────────────────────────────
-# MARKET SNAPSHOT
+# SNAPSHOT
 # ─────────────────────────────────────────────────────────────
-market_snapshot = {
+snapshot = {
     "timestamp_utc": datetime.now(timezone.utc).isoformat(),
     "price": round(float(latest.close), 2),
     "ema_50": round(float(latest.ema_50), 2),
     "ema_200": round(float(latest.ema_200), 2),
     "atr": round(float(latest.atr), 2),
-    "trend": trend
+    "trend": trend,
+    "mode": MODE
 }
 
 st.subheader("📊 Market Snapshot")
-st.json(market_snapshot)
+st.json(snapshot)
 
 # ─────────────────────────────────────────────────────────────
 # AI (DETERMINISTIC)
@@ -114,14 +146,13 @@ def run_ai(name, role):
 You are {name}, acting strictly as a {role}.
 
 You are given a frozen market snapshot.
-You MUST NOT assume future candles.
-You MUST NOT invent data.
-You MUST return VALID JSON ONLY.
+Do NOT invent data.
+Return VALID JSON ONLY.
 
 SNAPSHOT:
-{json.dumps(market_snapshot, indent=2)}
+{json.dumps(snapshot, indent=2)}
 
-Return EXACTLY this schema:
+Schema:
 
 {{
   "bias": "LONG | SHORT | NO_TRADE",
@@ -134,30 +165,31 @@ Return EXACTLY this schema:
     return json.loads(response.text)
 
 # ─────────────────────────────────────────────────────────────
-# MULTI-AI
+# AI RUN
 # ─────────────────────────────────────────────────────────────
+st.subheader("🤖 AI Verdicts")
+
 ai_outputs = {
     "Structure_AI": run_ai("Structure AI", "market structure analyst"),
     "Trend_AI": run_ai("Trend AI", "EMA trend analyst"),
     "Risk_AI": run_ai("Risk AI", "risk control analyst")
 }
 
-st.subheader("🤖 AI Outputs")
 st.json(ai_outputs)
 
 # ─────────────────────────────────────────────────────────────
 # CONSENSUS
 # ─────────────────────────────────────────────────────────────
-bias_votes = [v["bias"] for v in ai_outputs.values()]
-final_bias = max(set(bias_votes), key=bias_votes.count)
+biases = [v["bias"] for v in ai_outputs.values()]
+final_bias = max(set(biases), key=biases.count)
 
 st.subheader("✅ Final Bias")
 st.success(final_bias)
 
 # ─────────────────────────────────────────────────────────────
-# MODE INFO
+# MODE NOTES
 # ─────────────────────────────────────────────────────────────
 if MODE == "PROP / FUNDED":
-    st.info("Prop / Funded mode active: conservative risk, trailing SL enforced.")
+    st.info("Prop mode: conservative risk, protection first.")
 else:
-    st.info("Growth mode active: relaxed trailing, scaling allowed.")
+    st.info("Growth mode: scaling and flexibility allowed.")
