@@ -147,6 +147,7 @@ Respond **ONLY** with valid JSON. No fences, no markdown, no extra text:
   "entry": number,
   "sl": number,
   "tp": number,
+  "lot": number,
   "rr": number,
   "style": "SCALP" | "SWING" | "BREAKOUT" | "REVERSAL" | "RANGE",
   "direction": "BULLISH" | "BEARISH",
