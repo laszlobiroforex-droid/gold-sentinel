@@ -15,7 +15,7 @@ td = TDClient(apikey=st.secrets["TWELVE_DATA_KEY"])
 genai.configure(api_key=st.secrets["GEMINI_KEY"])
 gemini_model = genai.GenerativeModel('gemini-2.5-flash')
 
-grok_client   = OpenAI(api_key=st.secrets["GROK_API_KEY"],  base_url="https://api.x.ai/v1")
+grok_client   = OpenAI(api_key=st.secrets["GROK_API_KEY"], base_url="https://api.x.ai/v1")
 openai_client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
 
 # ─── TELEGRAM ──────────────────────────────────────────────────────────────
@@ -23,7 +23,7 @@ def send_telegram(message, priority="normal"):
     token   = st.secrets.get("TELEGRAM_BOT_TOKEN")
     chat_id = st.secrets.get("TELEGRAM_CHAT_ID")
     if not token or not chat_id:
-        st.warning("Telegram not configured")
+        st.warning("Telegram not configured (TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID missing in secrets)")
         return
 
     emoji = "🟢 ELITE" if priority == "high" else "🔵 Conviction"
@@ -31,8 +31,8 @@ def send_telegram(message, priority="normal"):
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     try:
         requests.post(url, json={"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}, timeout=8)
-    except:
-        st.error("Telegram send failed")
+    except Exception as e:
+        st.error(f"Telegram send failed: {e}")
 
 # ─── FRESH DATA FETCH (no caching) ─────────────────────────────────────────
 def get_live_price():
@@ -74,10 +74,10 @@ def parse_ai_output(text):
             "direction": data.get("direction", "NEUTRAL").upper(),
             "reasoning": data.get("reasoning", "")
         }
-    except:
+    except Exception as e:
         return {
             "verdict": "PARSE_ERROR",
-            "reason": f"Invalid JSON. Raw: {text[:150]}..."
+            "reason": f"Invalid JSON: {str(e)}. Raw: {text[:150]}..."
         }
 
 # ─── MAIN CHECK ─────────────────────────────────────────────────────────────
@@ -88,7 +88,7 @@ def run_check():
         ts_1h  = fetch_1h()
 
     if ts_15m.empty:
-        st.error("No 15m data received")
+        st.error("No 15m data received from Twelve Data")
         return
 
     latest_15m = ts_15m.iloc[-1]
@@ -117,7 +117,6 @@ You are a high-conviction gold trading auditor.
 Use ONLY the provided data — do NOT hallucinate prices, levels, or facts.
 
 Current UTC: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}
-NY session close \~22:00 UTC — watch whipsaw after 21:30 UTC.
 
 Market data:
 Price: ${price:.2f}
@@ -130,21 +129,25 @@ Recent fractals: {', '.join([f"{t}@{p}" for t,p in levels[-6:]]) or 'None'}
 
 Account info: balance {balance if balance else 'unknown'}, risk % {risk_pct if risk_pct else 'unknown'}, buffer {buffer if buffer else 'unknown'}
 
-Analyze current Gold setup. Be brutal — if low edge, say skip.
-Propose entry / SL / TP / RR / style / direction only if high conviction exists.
+Analyze the current Gold market and propose your best available setup right now.
+Be cautious and realistic — clearly state the edge strength in "reason".
+Always provide concrete values for entry, SL, TP, RR, style and direction unless the market is genuinely untradeable (very rare).
+
+Even if the edge is only moderate, still propose something sensible rather than saying skip.
+Only use null for entry/sl/tp/rr if there is truly no reasonable trade at all.
 
 Respond **ONLY** with valid JSON. No fences, no markdown, no extra text:
 
 {{
-  "verdict": "ELITE" | "HIGH_CONV" | "LOW_EDGE" | "GAMBLE" | "SKIP",
-  "reason": "short explanation",
-  "entry": number or null,
-  "sl": number or null,
-  "tp": number or null,
-  "rr": number or null,
-  "style": "SCALP" | "SWING" | "BREAKOUT" | "REVERSAL" | "RANGE" | "NONE",
-  "direction": "BULLISH" | "BEARISH" | "NEUTRAL",
-  "reasoning": "1-2 sentences"
+  "verdict": "ELITE" | "HIGH_CONV" | "MODERATE" | "LOW_EDGE" | "GAMBLE",
+  "reason": "short explanation of edge strength",
+  "entry": number,
+  "sl": number,
+  "tp": number,
+  "rr": number,
+  "style": "SCALP" | "SWING" | "BREAKOUT" | "REVERSAL" | "RANGE",
+  "direction": "BULLISH" | "BEARISH",
+  "reasoning": "1-2 sentences why this setup"
 }}
 """
 
@@ -203,9 +206,9 @@ Respond **ONLY** with valid JSON. No fences, no markdown, no extra text:
         colors = {
             "ELITE": "#2ecc71",
             "HIGH_CONV": "#3498db",
+            "MODERATE": "#f1c40f",
             "LOW_EDGE": "#e67e22",
             "GAMBLE": "#e74c3c",
-            "SKIP": "#95a5a6",
             "PARSE_ERROR": "#7f8c8d",
             "UNKNOWN": "#7f8c8d"
         }
@@ -281,7 +284,7 @@ Respond **ONLY** with valid JSON. No fences, no markdown, no extra text:
         st.info("No strong consensus — no Telegram sent.")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# AUTO-CHECK TIMER
+# AUTO-CHECK TIMER (browser-based)
 # ─────────────────────────────────────────────────────────────────────────────
 if "last_check_time" not in st.session_state:
     st.session_state.last_check_time = 0
@@ -296,9 +299,8 @@ if auto_enabled:
         st.session_state.last_check_time = now
         st.info(f"Auto-check running... (last was {int(time_since_last/60)} min ago)")
         run_check()
-        st.rerun()
     else:
-        remaining = CHECK_INTERVAL_MIN * 60 - int(time_since_last)
+        remaining = int(CHECK_INTERVAL_MIN * 60 - time_since_last)
         st.caption(f"Next auto-check in {remaining // 60} min {remaining % 60} sec (tab must stay open & active)")
 else:
     st.info("Auto-check off — press button manually or enable above.")
