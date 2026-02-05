@@ -8,7 +8,7 @@ import requests
 import numpy as np
 
 # ─── CONFIG ────────────────────────────────────────────────────────────────
-# All account fields optional — no defaults
+CHECK_INTERVAL_MIN = 15
 
 # ─── API INIT ──────────────────────────────────────────────────────────────
 td = TDClient(apikey=st.secrets["TWELVE_DATA_KEY"])
@@ -34,18 +34,15 @@ def send_telegram(message, priority="normal"):
     except:
         st.error("Telegram send failed")
 
-# ─── CACHED DATA FETCH (only price + 15m + 1h) ─────────────────────────────
-@st.cache_data(ttl=60)
+# ─── FRESH DATA FETCH (no caching) ─────────────────────────────────────────
 def get_live_price():
     return float(td.price(symbol="XAU/USD").as_json()["price"])
 
-@st.cache_data(ttl=300)
 def fetch_15m():
     ts = td.time_series(symbol="XAU/USD", interval="15min", outputsize=120)
     ts = ts.with_rsi().with_ema(time_period=200).with_ema(time_period=50).with_atr(time_period=14)
     return ts.as_pandas()
 
-@st.cache_data(ttl=300)
 def fetch_1h():
     ts = td.time_series(symbol="XAU/USD", interval="1h", outputsize=60)
     ts = ts.with_ema(time_period=200)
@@ -85,13 +82,13 @@ def parse_ai_output(text):
 
 # ─── MAIN CHECK ─────────────────────────────────────────────────────────────
 def run_check():
-    with st.spinner("Fetching market data..."):
+    with st.spinner("Fetching fresh market data..."):
         price = get_live_price()
         ts_15m = fetch_15m()
         ts_1h  = fetch_1h()
 
     if ts_15m.empty:
-        st.error("No 15m data")
+        st.error("No 15m data received")
         return
 
     latest_15m = ts_15m.iloc[-1]
@@ -284,8 +281,29 @@ Respond **ONLY** with valid JSON. No fences, no markdown, no extra text:
         st.info("No strong consensus — no Telegram sent.")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# UI
+# AUTO-CHECK TIMER
 # ─────────────────────────────────────────────────────────────────────────────
+if "last_check_time" not in st.session_state:
+    st.session_state.last_check_time = 0
+
+auto_enabled = st.checkbox("Run automatically every 15 minutes (keep tab open & active)", value=False)
+
+if auto_enabled:
+    now = time.time()
+    time_since_last = now - st.session_state.last_check_time
+
+    if time_since_last >= CHECK_INTERVAL_MIN * 60:
+        st.session_state.last_check_time = now
+        st.info(f"Auto-check running... (last was {int(time_since_last/60)} min ago)")
+        run_check()
+        st.rerun()
+    else:
+        remaining = CHECK_INTERVAL_MIN * 60 - int(time_since_last)
+        st.caption(f"Next auto-check in {remaining // 60} min {remaining % 60} sec (tab must stay open & active)")
+else:
+    st.info("Auto-check off — press button manually or enable above.")
+
+# ─── UI ─────────────────────────────────────────────────────────────────────
 st.set_page_config(page_title="Gold Sentinel", page_icon="🥇", layout="wide")
 st.title("🥇 Gold Sentinel – AI-Driven Gold Setups")
 st.caption(f"Three AIs decide everything | {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
@@ -303,5 +321,5 @@ with st.expander("Account Info (all optional)", expanded=False):
     if risk_input is not None:
         st.session_state.risk_pct = risk_input
 
-if st.button("📡 Run Analysis (\~4 credits)", type="primary", use_container_width=True):
+if st.button("📡 Run Analysis Now (\~8 credits)", type="primary", use_container_width=True):
     run_check()
