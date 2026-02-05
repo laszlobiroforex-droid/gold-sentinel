@@ -60,7 +60,7 @@ def safe_td_call(func, *args, **kwargs):
             except:
                 st.error("Still limited after wait. Try again in a minute or upgrade plan.")
                 return None
-        raise e  # Other errors get normal retry
+        raise e
 
 # ─── API INIT ────────────────────────────────────────────────────────────────
 try:
@@ -122,8 +122,7 @@ def fetch_upcoming_events():
 
             event_name = row.find("td", class_="event").get_text(strip=True)
 
-            if impact_level >= 2 and (currency in ["USD", "XAU", "ALL"] or 
-                                      any(kw in event_name.lower() for kw in ["fed", "cpi", "nfp", "payroll", "fomc", "rate", "inflation", "geopol"])):
+            if impact_level >= 2 and (currency in ["USD", "XAU", "ALL"] or any(kw in event_name.lower() for kw in ["fed", "cpi", "nfp", "payroll", "fomc", "rate", "inflation", "geopol"])):
                 events.append({
                     "time": event_time,
                     "name": event_name,
@@ -456,7 +455,7 @@ st.title("🥇 Gold Sentinel – High Conviction Gold Entries")
 st.caption(f"Adaptive engine | Safe auto-check while page open | {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
 
 # Auto-check controls (always visible)
-auto_enabled = st.checkbox("Enable auto-check while this page is open", value=False)  # Default off for safety
+auto_enabled = st.checkbox("Enable auto-check while this page is open", value=False)  # Default off
 auto_interval_min = st.slider("Check every (minutes)", 10, 60, 15, step=5)
 
 # Usage monitor
@@ -485,7 +484,7 @@ if not st.session_state.analysis_done:
     st.session_state.floor = st.number_input("Floor ($)", value=st.session_state.floor, format="%.2f")
     st.session_state.risk_pct = st.slider("Risk % per trade", 5, 50, st.session_state.risk_pct, step=5)
 
-    if st.button("🚀 Analyze & Suggest", type="primary"):
+    if st.button("🚀 Analyze & Suggest", type="primary", key="analyze_settings"):
         if st.session_state.balance <= 0:
             st.error("Valid balance required")
         elif time.time() - st.session_state.last_analysis < 60:
@@ -495,7 +494,7 @@ if not st.session_state.analysis_done:
             st.session_state.analysis_done = True
             st.rerun()
 
-    if st.button("📡 Manual Alert Check Now (\~4 credits)"):
+    if st.button("📡 Manual Alert Check Now (\~4 credits)", key="manual_settings"):
         with st.spinner("Running manual check..."):
             check_for_high_conviction_setup()
         st.success("Manual check done. See Telegram if setup found.")
@@ -535,7 +534,7 @@ else:
         cols[2].markdown("**ChatGPT**")
         cols[2].json(c_raw if 'c_raw' in locals() else "No data yet")
 
-# ─── SAFE AUTO-CHECK TIMER (runs on EVERY script execution) ───────────────────
+# ─── SAFE AUTO-CHECK TIMER (runs on EVERY page load / refresh) ───────────────────
 CHECK_INTERVAL_SEC = auto_interval_min * 60
 
 if auto_enabled:
@@ -558,7 +557,7 @@ else:
     st.info("Auto-check paused. Use manual button above.")
 
 # Manual alert button (always available)
-if st.button("📡 Manual Alert Check Now (\~4 credits)"):
+if st.button("📡 Manual Alert Check Now (\~4 credits)", key="manual_global"):
     with st.spinner("Running manual check..."):
         check_for_high_conviction_setup()
     st.success("Manual check done. See Telegram if setup found.")
