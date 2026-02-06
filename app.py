@@ -328,9 +328,9 @@ st.caption(f"Gemini • Grok • ChatGPT | {datetime.now(timezone.utc).strftime(
 
 # ─── RISK SETTINGS (persistent defaults) ────────────────────────────────────
 with st.expander("Prop Challenge / Risk Settings (required for lot sizing)", expanded=True):
-    default_balance = st.session_state.get("balance", 5029.00)
-    default_dd = st.session_state.get("dd_limit", 251.45)
-    default_risk_pct = st.session_state.get("risk_of_dd_pct", 20.0)
+    default_balance = st.session_state.get("balance", none)
+    default_dd = st.session_state.get("dd_limit", none)
+    default_risk_pct = st.session_state.get("risk_of_dd_pct", 25.0)
 
     col1, col2, col3 = st.columns(3)
     with col1:
