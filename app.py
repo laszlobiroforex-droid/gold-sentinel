@@ -159,44 +159,37 @@ def run_check():
     prompt = f"""
 You are a disciplined, high-probability gold (XAU/USD) trader focused on capital preservation, precise entries, and waiting for confirmation.
 
-Current live price is ${price:.2f} — ALL levels, entries, SL, TP MUST be realistic relative to this price. Never suggest entries/SL/TP hundreds or thousands away from current price.
+Current live price is EXACTLY ${price:.2f} — this is the ONLY valid reference price.
+
+CRITICAL RULES — VIOLATE THESE AND THE SETUP IS INVALID:
+- ALL prices (entry, SL, TP, levels, fractals) MUST be within ±5% of current price ${price:.2f}. Anything outside this range is hallucinated and MUST be rejected.
+- Never use historical 2000s prices or any number hundreds/thousands away — gold is currently in the ${int(price/1000)*1000}s range.
+- If any calculated level is unrealistic, output verdict "NO_EDGE" with reason "price hallucination detected".
 
 Account risk guidelines (preferred but not absolute hard cap):
 - Current balance ≈ ${balance if balance else 'unknown'}
 - Daily drawdown limit: ${dd_limit if dd_limit else 'unknown'}
 - Preferred maximum risk per trade: {risk_of_dd_pct if risk_of_dd_pct else 'unknown'}% of daily DD limit → ${max_risk_dollars:.2f} preferred max loss if stopped out
-- You MAY propose setups that exceed this preferred risk ONLY if the estimated win probability is very high (≥75–80%) and the structure is exceptionally clean
-- When exceeding: ALWAYS clearly state the actual risk % and dollars, and warn that it exceeds the user's preferred limit
+- You MAY exceed ONLY for ≥75–80% win prob setups, with clear warning
 
-Core philosophy & entry style:
-- Prioritize only high-probability setups (conservative estimate ≥65–70% win rate when possible, ≥75–80% for any over-risk proposals)
-- Prefer waiting for confirmation: pullbacks to strong support/resistance (limit orders), retests after breakouts, stop orders for clean breakouts
-- The edge comes from getting filled at advantageous prices and having favorable risk-reward — NOT from forcing entries or chasing momentum
-- Accept lower RR (1:1, 0.8:1, even 0.7:1) if the setup has very high probability and clean structure
-- If a high-prob setup would require exceeding the preferred risk → still propose it, but with strong warning and exact overage calculation
-- If no high-quality setup exists (even allowing over-risk for exceptional cases) → verdict = "NO_EDGE"
+Core philosophy:
+- Prioritize high-prob setups (≥65–70%, ≥75–80% for over-risk)
+- Prefer limit (pullback) or stop (breakout) entries for confirmation
+- Accept low RR for high prob
+- If no valid setup → "NO_EDGE"
 
-Analysis steps you must follow internally:
-1. Evaluate structure, momentum, key levels, RSI/EMA/ATR confluence, recent fractals
-2. Identify the highest-conviction setups that allow waiting for confirmation
-3. For each potential setup:
-   - Decide realistic entry type: limit (pullback), stop (breakout), or market (rare, only immediate strong edge)
-   - Set tight SL behind structure
-   - Set TP at next logical level
-   - Calculate risk in points and required lot to achieve target RR
-   - Calculate dollar risk and % of daily DD with that lot
-   - Estimate conservative win probability (technicals only)
-4. Decision rules:
-   - If win prob ≥65% AND risk ≤ preferred ${max_risk_dollars:.2f} → propose normally
-   - If win prob ≥75–80% AND setup is exceptional → propose even if risk exceeds preferred limit, but include clear warning
-   - If win prob <65% → reject unless truly outstanding (rare)
-   - Never hide over-risk — always disclose
+Analysis steps:
+1. Anchor EVERYTHING to current price ${price:.2f}
+2. Check fractals/levels are recent and realistic
+3. Only propose if all prices are sane (±5%)
+4. Calculate risk/lot conservatively
+5. Reject anything unrealistic
 
-Output format — respond **ONLY** with valid JSON. No extra text, no fences:
+Output **ONLY** valid JSON:
 
 {{
   "verdict": "ELITE" | "HIGH_CONV" | "MODERATE" | "LOW_EDGE" | "NO_EDGE",
-  "reason": "One sentence on edge strength, probability, and risk fit (include warning if exceeding preferred limit)",
+  "reason": "One sentence including price sanity check",
   "entry_type": "LIMIT" | "STOP" | "MARKET" | null,
   "entry_price": number or null,
   "sl": number or null,
@@ -209,11 +202,10 @@ Output format — respond **ONLY** with valid JSON. No extra text, no fences:
   "exceeds_preferred_risk": boolean,
   "style": "SCALP" | "SWING" | "BREAKOUT" | "REVERSAL" | "RANGE" | "NONE",
   "direction": "BULLISH" | "BEARISH" | "NEUTRAL",
-  "reasoning": "2–4 sentences: structure/confluence, why waiting for pullback/breakout, probability reasoning, risk calculation & any overage warning"
+  "reasoning": "2–4 sentences: confirm prices are realistic relative to ${price:.2f}, structure, probability, risk"
 }}
 
-If no trade meets the criteria (even allowing over-risk for exceptional high-prob cases), use "NO_EDGE" and explain.
-Always be transparent about risk — never silently exceed the preferred limit.
+Use "NO_EDGE" if any price looks hallucinated or unrealistic.
 """
 
     with st.spinner("Consulting AIs..."):
