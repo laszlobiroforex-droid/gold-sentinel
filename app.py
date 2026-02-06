@@ -14,7 +14,7 @@ CHECK_INTERVAL_MIN = 15
 # ─── API INIT ──────────────────────────────────────────────────────────────
 td = TDClient(apikey=st.secrets["TWELVE_DATA_KEY"])
 genai.configure(api_key=st.secrets["GEMINI_KEY"])
-gemini_model = genai.GenerativeModel('gemini-1.5-flash')  # or 'gemini-1.5-pro' if you have access
+gemini_model = genai.GenerativeModel('gemini-2.5-flash')  # ← reverted to your original
 
 grok_client   = OpenAI(api_key=st.secrets["GROK_API_KEY"], base_url="https://api.x.ai/v1")
 openai_client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
@@ -24,18 +24,18 @@ def send_telegram(message, priority="normal"):
     token   = st.secrets.get("TELEGRAM_BOT_TOKEN")
     chat_id = st.secrets.get("TELEGRAM_CHAT_ID")
     if not token or not chat_id:
-        st.warning("Telegram not configured (missing bot token or chat ID in secrets)")
+        st.warning("Telegram not configured (TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID missing in secrets)")
         return
 
     emoji = "🟢 ELITE" if priority == "high" else "🔵 Conviction"
     text = f"{emoji} Gold Setup Alert\n\n{message}\n\n{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     try:
-        requests.post(url, json={"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}, timeout=10)
+        requests.post(url, json={"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}, timeout=8)
     except Exception as e:
         st.error(f"Telegram send failed: {e}")
 
-# ─── DATA FETCH ────────────────────────────────────────────────────────────
+# ─── FRESH DATA FETCH ──────────────────────────────────────────────────────
 def get_live_price():
     try:
         return float(td.price(symbol="XAU/USD").as_json()["price"])
@@ -65,16 +65,17 @@ def parse_ai_output(text):
 
     start = text.find('{')
     end   = text.rfind('}') + 1
-    if start == -1 or end <= start:
-        return {"verdict": "PARSE_ERROR", "reason": "No JSON block found"}
+    if start == -1 or end == 0:
+        return {"verdict": "PARSE_ERROR", "reason": "No JSON found"}
 
-    json_str = text[start:end].strip().replace('```json', '').replace('```', '').strip()
+    json_str = text[start:end].strip()
+    json_str = json_str.replace('```json', '').replace('```', '').strip()
 
     try:
         data = json.loads(json_str)
         return {
             "verdict": data.get("verdict", "UNKNOWN").upper(),
-            "reason": data.get("reason", "No reason provided"),
+            "reason": data.get("reason", "No reason"),
             "entry": data.get("entry"),
             "sl": data.get("sl"),
             "tp": data.get("tp"),
@@ -86,43 +87,38 @@ def parse_ai_output(text):
     except Exception as e:
         return {
             "verdict": "PARSE_ERROR",
-            "reason": f"JSON parse failed: {str(e)}. Raw: {text[:120]}..."
+            "reason": f"Invalid JSON: {str(e)}. Raw: {text[:150]}..."
         }
 
-# ─── LOT SIZE CALCULATION (XAU/USD micro lots) ─────────────────────────────
-def calculate_lot_size(entry, sl, direction, balance, dd_limit, risk_of_dd_pct):
+# ─── LOT SIZE CALCULATION ──────────────────────────────────────────────────
+def calculate_lot_size(entry, sl, balance, dd_limit, risk_of_dd_pct):
     if not all([entry, sl, balance, dd_limit, risk_of_dd_pct]):
-        return None, "Missing data for lot size calculation"
+        return None, "Missing data for lot calc"
 
     try:
         entry = float(entry)
-        sl = float(sl)
+        sl    = float(sl)
         price_diff = abs(entry - sl)
         if price_diff <= 0:
-            return None, "Invalid stop-loss distance"
+            return None, "Invalid SL distance"
 
         max_risk_dollars = (dd_limit * risk_of_dd_pct) / 100.0
 
-        # XAU/USD: 0.01 lot = 1 oz → $1 P/L per $1 price move
-        # → lot size = max_risk_dollars / price_diff   (in 0.01 lot units? Wait)
-        # Correct formula:
-        # Risk $ = (lot size in standard lots) × price_diff × 100
-        # Because 1 standard lot = 100 oz → $100 per $1 move
-        # So lot_size_standard = max_risk_dollars / (price_diff * 100)
-        lot_size_standard = max_risk_dollars / (price_diff * 100)
-        lot_size_rounded = round(lot_size_standard, 2)  # Brokers usually allow 0.01 steps
+        # XAU/USD: 0.01 lot = $1 per $1 price move
+        # Risk $ = lots × price_diff × 100
+        lot_size = max_risk_dollars / (price_diff * 100)
+        lot_size_rounded = round(lot_size, 2)
 
+        note = ""
         if lot_size_rounded < 0.01:
             lot_size_rounded = 0.01
-            note = "(minimum lot applied – actual risk lower)"
-        else:
-            note = ""
+            note = "(min 0.01 lot applied – actual risk lower)"
 
         return lot_size_rounded, f"${max_risk_dollars:.2f} risk → {lot_size_rounded:.2f} lots {note}"
     except:
-        return None, "Calculation error"
+        return None, "Calc error"
 
-# ─── MAIN ANALYSIS FUNCTION ────────────────────────────────────────────────
+# ─── MAIN CHECK ────────────────────────────────────────────────────────────
 def run_check():
     with st.spinner("Fetching fresh market data..."):
         price = get_live_price()
@@ -130,10 +126,10 @@ def run_check():
         ts_1h  = fetch_1h()
 
     if price is None:
-        st.error("Failed to fetch current gold price")
+        st.error("Failed to fetch live price")
         return
     if ts_15m is None or ts_15m.empty:
-        st.error("No 15m data received from Twelve Data")
+        st.error("No 15m data received")
         return
 
     latest_15m = ts_15m.iloc[-1]
@@ -144,7 +140,7 @@ def run_check():
 
     ema200_1h = ts_1h.iloc[-1].get('ema_200', price) if ts_1h is not None and not ts_1h.empty else price
 
-    # Recent fractal levels (S/R)
+    # Recent fractals
     levels = []
     for i in range(5, len(ts_15m)-5):
         if ts_15m['high'].iloc[i] == ts_15m['high'].iloc[i-5:i+5].max():
@@ -152,7 +148,6 @@ def run_check():
         if ts_15m['low'].iloc[i] == ts_15m['low'].iloc[i-5:i+5].min():
             levels.append(('SUP', round(ts_15m['low'].iloc[i], 2)))
 
-    # Account info
     balance       = st.session_state.get("balance")
     dd_limit      = st.session_state.get("dd_limit")
     risk_of_dd_pct = st.session_state.get("risk_of_dd_pct")
@@ -175,8 +170,8 @@ Recent support/resistance fractals: {', '.join([f"{t}@{p}" for t,p in levels[-8:
 Account context: Balance \~\( {balance if balance else 'unknown'}, Daily DD limit \~ \){dd_limit if dd_limit else 'unknown'}
 
 Identify the best realistic trading setup available right now — even if the edge is only moderate.
-Always propose concrete entry, SL, TP, RR unless the market has truly no structure or direction (very flat/range-bound).
-Be objective and favor probability over aggression.
+Always propose concrete entry, SL, TP, RR unless the market has truly no structure or direction.
+Be objective and favor probability.
 
 Verdict levels (use these exactly):
 - ELITE
@@ -184,7 +179,7 @@ Verdict levels (use these exactly):
 - MODERATE
 - LOW_EDGE
 
-Respond **ONLY** with valid JSON. No extra text, no fences, no explanations outside JSON:
+Respond **ONLY** with valid JSON. No extra text, no fences:
 
 {{
   "verdict": "ELITE" | "HIGH_CONV" | "MODERATE" | "LOW_EDGE",
@@ -205,29 +200,29 @@ Respond **ONLY** with valid JSON. No extra text, no fences, no explanations outs
         try:
             g_raw = gemini_model.generate_content(prompt).text.strip()
         except Exception as e:
-            st.warning(f"Gemini error: {e}")
+            st.warning(f"Gemini failed: {str(e)}")
 
         try:
             r = grok_client.chat.completions.create(
-                model="grok-beta",  # or "grok-4" if available
+                model="grok-4",  # ← reverted to your original
                 messages=[{"role": "user", "content": prompt}],
-                max_tokens=350,
-                temperature=0.5
+                max_tokens=300,
+                temperature=0.4
             )
             k_raw = r.choices[0].message.content.strip()
         except Exception as e:
-            st.warning(f"Grok error: {e}")
+            st.warning(f"Grok failed: {str(e)}")
 
         try:
             resp = openai_client.chat.completions.create(
                 model="gpt-4o-mini",
                 messages=[{"role": "user", "content": prompt}],
-                max_tokens=350,
-                temperature=0.6
+                max_tokens=300,
+                temperature=0.5
             )
             c_raw = resp.choices[0].message.content.strip()
         except Exception as e:
-            st.warning(f"ChatGPT error: {e}")
+            st.warning(f"ChatGPT failed: {str(e)}")
 
     g_p = parse_ai_output(g_raw)
     k_p = parse_ai_output(k_raw)
@@ -235,39 +230,38 @@ Respond **ONLY** with valid JSON. No extra text, no fences, no explanations outs
 
     high_count = sum(1 for p in [g_p, k_p, c_p] if p["verdict"] in ["ELITE", "HIGH_CONV"])
 
-    # Select "best" for consensus lot size
-    best_p = max([g_p, k_p, c_p], key=lambda p: {"ELITE":4, "HIGH_CONV":3, "MODERATE":2, "LOW_EDGE":1, "UNKNOWN":0, "PARSE_ERROR":0}.get(p["verdict"], 0))
+    # Best for consensus lot sizing
+    verdict_scores = {"ELITE": 4, "HIGH_CONV": 3, "MODERATE": 2, "LOW_EDGE": 1}
+    best_p = max([g_p, k_p, c_p], key=lambda p: verdict_scores.get(p["verdict"], 0))
 
     lot_size, lot_note = calculate_lot_size(
-        best_p.get("entry"), best_p.get("sl"), best_p.get("direction"),
+        best_p.get("entry"), best_p.get("sl"),
         balance, dd_limit, risk_of_dd_pct
     )
 
-    # ─── DISPLAY VERDICTS ──────────────────────────────────────────────────────
+    # ─── DISPLAY ───────────────────────────────────────────────────────────────
     st.divider()
-    st.subheader("AI Analysis Results")
+    st.subheader("AI Verdicts")
 
-    def format_verdict(p, ai_name, consensus_lot=None, consensus_note=None):
+    def format_verdict(p, ai_name, lot=None, note=""):
         if p["verdict"] == "PARSE_ERROR":
             return f"**{ai_name}** — Parse error: {p['reason']}"
 
         verdict = p["verdict"]
         colors = {
-            "ELITE": "#2ecc71", "HIGH_CONV": "#3498db", "MODERATE": "#f1c40f",
-            "LOW_EDGE": "#e67e22", "PARSE_ERROR": "#7f8c8d", "UNKNOWN": "#95a5a6"
+            "ELITE": "#2ecc71", "HIGH_CONV": "#3498db",
+            "MODERATE": "#f1c40f", "LOW_EDGE": "#e67e22",
+            "PARSE_ERROR": "#7f8c8d", "UNKNOWN": "#7f8c8d"
         }
         color = colors.get(verdict, "#7f8c8d")
 
-        entry = f"${p['entry']:.2f}" if p["entry"] else "—"
-        sl    = f"${p['sl']:.2f}"    if p["sl"]    else "—"
-        tp    = f"${p['tp']:.2f}"    if p["tp"]    else "—"
-        rr    = f"1:{p['rr']:.1f}"   if p["rr"]    else "—"
-
-        lot_str = consensus_lot if consensus_lot else "—"
-        note_str = consensus_note or ""
+        entry = f"${p['entry']:.2f}" if p["entry"] is not None else "—"
+        sl    = f"${p['sl']:.2f}"    if p["sl"]    is not None else "—"
+        tp    = f"${p['tp']:.2f}"    if p["tp"]    is not None else "—"
+        rr    = f"1:{p['rr']:.1f}"   if p["rr"]    is not None else "—"
 
         html = f"""
-        <div style="background:{color}11; border-left:5px solid {color}; padding:16px 20px; margin:12px 0; border-radius:8px; box-shadow:0 2px 8px rgba(0,0,0,0.1);">
+        <div style="background:{color}11; border-left:5px solid {color}; padding:16px 20px; margin:16px 0; border-radius:8px; box-shadow:0 2px 8px rgba(0,0,0,0.1);">
             <div style="font-size:1.3em; font-weight:bold; color:{color}; margin-bottom:8px;">
                 {ai_name} — {verdict}
             </div>
@@ -280,35 +274,32 @@ Respond **ONLY** with valid JSON. No extra text, no fences, no explanations outs
                 <div><strong>TP:</strong> {tp}</div>
                 <div><strong>RR:</strong> {rr}</div>
             </div>
-            <div style="margin-top:8px; font-weight:bold;">Suggested lot: {lot_str}</div>
-            <div style="color:#555; font-size:0.9em;">{note_str}</div>
+            <div style="margin:8px 0; font-weight:bold;">Lot size: {lot if lot else '—'}</div>
+            <div style="color:#555; font-size:0.9em;">{note}</div>
             <div style="font-style:italic; color:#444; margin-top:12px;">{p['reasoning']}</div>
         </div>
         """
         return html
 
     col1, col2, col3 = st.columns(3)
-    with col1:
-        st.markdown(format_verdict(g_p, "Gemini", lot_size, lot_note), unsafe_allow_html=True)
-    with col2:
-        st.markdown(format_verdict(k_p, "Grok", lot_size, lot_note), unsafe_allow_html=True)
-    with col3:
-        st.markdown(format_verdict(c_p, "ChatGPT", lot_size, lot_note), unsafe_allow_html=True)
+    with col1: st.markdown(format_verdict(g_p, "Gemini",   lot_size, lot_note), unsafe_allow_html=True)
+    with col2: st.markdown(format_verdict(k_p, "Grok",     lot_size, lot_note), unsafe_allow_html=True)
+    with col3: st.markdown(format_verdict(c_p, "ChatGPT",  lot_size, lot_note), unsafe_allow_html=True)
 
-    # ─── CONSENSUS & TELEGRAM ──────────────────────────────────────────────────
+    # ─── CONSENSUS & ALERT ─────────────────────────────────────────────────────
     if high_count >= 2:
         entries = [p["entry"] for p in [g_p, k_p, c_p] if p["entry"] is not None]
         consensus_note = ""
         if len(entries) >= 2:
             spread = max(entries) - min(entries)
             if spread <= atr * 0.8:
-                median_entry = np.median(entries)
-                consensus_note = f"\nConsensus entry (tight cluster): ${median_entry:.2f}"
+                median = np.median(entries)
+                consensus_note = f"\nConsensus entry ≈ ${median:.2f}"
             else:
-                consensus_note = "\nEntries spread out — review individually"
+                consensus_note = "\nEntries spread — check manually"
 
         msg = (
-            f"**High Conviction Consensus ({high_count}/3 AIs)**\n"
+            f"**Consensus High Conviction ({high_count}/3)**\n"
             f"Direction: {best_p['direction']}\n"
             f"Style: {best_p['style']}\n"
             f"Entry: ${best_p['entry']:.2f}\n"
@@ -321,52 +312,48 @@ Respond **ONLY** with valid JSON. No extra text, no fences, no explanations outs
 
         priority = "high" if high_count == 3 else "normal"
         send_telegram(msg, priority=priority)
-        st.success(f"High conviction consensus detected ({high_count}/3) — Telegram sent!")
+        st.success("High conviction consensus — Telegram alert sent!")
     else:
-        st.info("No strong consensus (need at least 2/3 ELITE or HIGH_CONV) — no alert sent.")
+        st.info("No strong consensus (need 2+ ELITE/HIGH_CONV) — no Telegram sent.")
 
 # ─── UI ─────────────────────────────────────────────────────────────────────
 st.set_page_config(page_title="Gold Sentinel", page_icon="🥇", layout="wide")
-st.title("🥇 Gold Sentinel – Multi-AI Gold Trading Setups")
-st.caption(f"Gemini • Grok • ChatGPT | {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
+st.title("🥇 Gold Sentinel – AI-Driven Gold Setups")
+st.caption(f"Three AIs decide everything | {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
 
-# Prop / Account settings
-with st.expander("Prop Challenge & Risk Settings", expanded=True):
-    col_a, col_b, col_c = st.columns(3)
-    with col_a:
-        balance = st.number_input("Current Balance ($)", min_value=0.0, step=0.01, value=5029.00, format="%.2f")
-    with col_b:
-        dd_limit = st.number_input("Daily Drawdown Limit ($)", min_value=0.0, step=1.0, value=251.45,
-                                   help="Usually 5% of evaluation balance or current balance", format="%.2f")
-    with col_c:
-        risk_of_dd_pct = st.number_input("Max risk % of Daily DD per trade", min_value=1, max_value=100, step=5, value=20,
-                                         help="10–30% typical – keeps you safe while allowing reasonable position sizing")
+# ─── ACCOUNT INPUTS ─────────────────────────────────────────────────────────
+with st.expander("Prop Challenge / Risk Settings", expanded=True):
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        balance = st.number_input("Current Balance ($)", min_value=0.0, step=0.01, value=5029.0, format="%.2f")
+    with col2:
+        dd_limit = st.number_input("Daily Drawdown Limit ($)", min_value=0.0, step=1.0, value=251.45, format="%.2f")
+    with col3:
+        risk_pct = st.number_input("Accepted risk % of Daily DD", min_value=1.0, max_value=100.0, value=20.0, step=1.0, format="%.0f")
 
-    if st.button("Save Risk Settings", use_container_width=True):
+    if st.button("Save Settings"):
         st.session_state.balance = balance
         st.session_state.dd_limit = dd_limit
-        st.session_state.risk_of_dd_pct = risk_of_dd_pct
-        st.success("Risk settings saved!")
+        st.session_state.risk_of_dd_pct = risk_pct
+        st.success("Settings saved!")
 
-# Auto / Manual run
-auto_enabled = st.checkbox("Auto-run every 15 minutes (keep tab open)", value=False)
+# ─── AUTO / MANUAL ─────────────────────────────────────────────────────────
+if "last_check_time" not in st.session_state:
+    st.session_state.last_check_time = 0
 
-if "last_check" not in st.session_state:
-    st.session_state.last_check = 0
+auto = st.checkbox("Auto-run every 15 min (keep tab open)", value=False)
 
-if auto_enabled:
+if auto:
     now = time.time()
-    elapsed = now - st.session_state.last_check
+    elapsed = now - st.session_state.last_check_time
     if elapsed >= CHECK_INTERVAL_MIN * 60:
-        st.session_state.last_check = now
-        st.info(f"Auto-running analysis... (last run {int(elapsed//60)} min ago)")
+        st.session_state.last_check_time = now
         run_check()
     else:
-        remaining = CHECK_INTERVAL_MIN * 60 - elapsed
-        mins, secs = divmod(int(remaining), 60)
-        st.caption(f"Next auto-run in {mins} min {secs} sec (tab must stay active)")
+        rem = int(CHECK_INTERVAL_MIN * 60 - elapsed)
+        st.caption(f"Next auto-run in {rem//60} min {rem%60} sec")
 else:
-    st.info("Auto mode off – use button below to run manually")
+    st.info("Auto off — use button below")
 
-if st.button("📡 Run Analysis Now (\~8–12 credits)", type="primary", use_container_width=True):
+if st.button("📡 Run Analysis Now", type="primary", use_container_width=True):
     run_check()
