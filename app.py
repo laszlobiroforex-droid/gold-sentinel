@@ -24,7 +24,7 @@ def send_telegram(message, priority="normal"):
     token   = st.secrets.get("TELEGRAM_BOT_TOKEN")
     chat_id = st.secrets.get("TELEGRAM_CHAT_ID")
     if not token or not chat_id:
-        st.warning("Telegram not configured")
+        st.warning("Telegram not configured (missing token or chat ID)")
         return
 
     emoji = "🟢 ELITE" if priority == "high" else "🔵 Conviction"
@@ -283,13 +283,30 @@ Always be transparent about risk — never silently exceed the preferred limit.
         }
         color = colors.get(verdict, "#7f8c8d")
 
-        entry_str = f"{p.get('entry_type', '—')} @ ${p.get('entry_price', '—'):.2f}"
-        sl_str    = f"${p.get('sl', '—'):.2f}"
-        tp_str    = f"${p.get('tp', '—'):.2f}"
-        rr_str    = f"1:{p.get('rr', '—'):.1f}"
-        prob_str  = f"{p.get('estimated_win_prob', '—')}%"
+        # Safe entry display
+        entry_type = p.get('entry_type', '—')
+        entry_price_val = p.get('entry_price')
+        if isinstance(entry_price_val, (int, float)):
+            entry_price_str = f"${entry_price_val:.2f}"
+        else:
+            entry_price_str = "—"
+        entry_str = f"{entry_type} @ {entry_price_str}"
 
-        # Safe risk formatting
+        # Safe SL, TP, RR
+        sl_val = p.get('sl')
+        sl_str = f"${sl_val:.2f}" if isinstance(sl_val, (int, float)) else "—"
+
+        tp_val = p.get('tp')
+        tp_str = f"${tp_val:.2f}" if isinstance(tp_val, (int, float)) else "—"
+
+        rr_val = p.get('rr')
+        rr_str = f"1:{rr_val:.1f}" if isinstance(rr_val, (int, float)) else "—"
+
+        # Prob
+        prob_val = p.get('estimated_win_prob')
+        prob_str = f"{prob_val}%" if isinstance(prob_val, (int, float)) else "—"
+
+        # Safe risk
         risk_dollars_val = p.get('risk_dollars')
         risk_pct_val     = p.get('risk_pct_of_dd')
         exceed_flag      = p.get('exceeds_preferred_risk', False)
@@ -307,9 +324,11 @@ Always be transparent about risk — never silently exceed the preferred limit.
         risk_str = f"{dollars_part} ({pct_part} of DD)"
         exceed_warning = '<span style="color:#e74c3c; font-weight:bold;">EXCEEDS preferred risk!</span>' if exceed_flag else ""
 
-        # Sanity check entry distance
-        if p.get('entry_price') and price and abs(p['entry_price'] - price) / price > 0.10:
+        # Entry distance sanity check
+        if isinstance(entry_price_val, (int, float)) and price and abs(entry_price_val - price) / price > 0.10:
             entry_str += ' <span style="color:#e74c3c;">(unrealistic distance!)</span>'
+
+        lot_str = f"{lot:.2f}" if lot is not None else "—"
 
         html = f"""
         <div style="background:{color}11; border-left:5px solid {color}; padding:16px 20px; margin:16px 0; border-radius:8px; box-shadow:0 2px 8px rgba(0,0,0,0.1);">
@@ -326,7 +345,7 @@ Always be transparent about risk — never silently exceed the preferred limit.
                 <div><strong>RR:</strong> {rr_str}</div>
                 <div><strong>Est. Win Prob:</strong> {prob_str}</div>
                 <div><strong>Risk:</strong> {risk_str} {exceed_warning}</div>
-                <div><strong>Lot size:</strong> {lot if lot else '—'}</div>
+                <div><strong>Lot size:</strong> {lot_str}</div>
             </div>
             <div style="color:#555; font-size:0.9em; margin:8px 0;">{note or ''}</div>
             <div style="font-style:italic; color:#444; margin-top:12px;">{p['reasoning']}</div>
