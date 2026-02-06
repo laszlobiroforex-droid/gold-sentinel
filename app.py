@@ -1,457 +1,372 @@
 import streamlit as st
-import pandas as pd
-import numpy as np
-import re
-import time
+import json
 from datetime import datetime, timezone
+import time
 from twelvedata import TDClient
 import google.generativeai as genai
 from openai import OpenAI
+import requests
+import numpy as np
 
-# ─── CONFIG ──────────────────────────────────────────────────────────────────
-SPREAD_BUFFER_POINTS = 0.30
-SLIPPAGE_BUFFER_POINTS = 0.20
-COMMISSION_PER_LOT_RT = 1.00     # USD round-turn per lot
-PIP_VALUE = 100                  # $ per 1.00 move per standard lot
+# ─── CONFIG ────────────────────────────────────────────────────────────────
+CHECK_INTERVAL_MIN = 15
 
-# ─── RETRY HELPER ────────────────────────────────────────────────────────────
-def retry_api(max_attempts=3, backoff=5):
-    def decorator(func):
-        def wrapper(*args, **kwargs):
-            for attempt in range(max_attempts):
-                try:
-                    return func(*args, **kwargs)
-                except Exception as e:
-                    if attempt == max_attempts - 1:
-                        raise e
-                    time.sleep(backoff * (attempt + 1))
-            return None
-        return wrapper
-    return decorator
+# ─── API INIT ──────────────────────────────────────────────────────────────
+td = TDClient(apikey=st.secrets["TWELVE_DATA_KEY"])
+genai.configure(api_key=st.secrets["GEMINI_KEY"])
+gemini_model = genai.GenerativeModel('gemini-1.5-flash')  # or 'gemini-1.5-pro' if you have access
 
-# ─── API INIT ────────────────────────────────────────────────────────────────
-try:
-    td = TDClient(apikey=st.secrets["TWELVE_DATA_KEY"])
-    genai.configure(api_key=st.secrets["GEMINI_KEY"])
-    gemini_model = genai.GenerativeModel('gemini-2.5-flash')
+grok_client   = OpenAI(api_key=st.secrets["GROK_API_KEY"], base_url="https://api.x.ai/v1")
+openai_client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
 
-    grok_client = OpenAI(
-        api_key=st.secrets["GROK_API_KEY"],
-        base_url="https://api.x.ai/v1",
-    )
+# ─── TELEGRAM ──────────────────────────────────────────────────────────────
+def send_telegram(message, priority="normal"):
+    token   = st.secrets.get("TELEGRAM_BOT_TOKEN")
+    chat_id = st.secrets.get("TELEGRAM_CHAT_ID")
+    if not token or not chat_id:
+        st.warning("Telegram not configured (missing bot token or chat ID in secrets)")
+        return
 
-    openai_client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
+    emoji = "🟢 ELITE" if priority == "high" else "🔵 Conviction"
+    text = f"{emoji} Gold Setup Alert\n\n{message}\n\n{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    try:
+        requests.post(url, json={"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}, timeout=10)
+    except Exception as e:
+        st.error(f"Telegram send failed: {e}")
 
-except Exception as e:
-    st.error(f"API setup failed: {e}\nCheck secrets.")
-    st.stop()
+# ─── DATA FETCH ────────────────────────────────────────────────────────────
+def get_live_price():
+    try:
+        return float(td.price(symbol="XAU/USD").as_json()["price"])
+    except:
+        return None
 
-# ─── FRACTAL LEVELS with filter ──────────────────────────────────────────────
-def get_fractal_levels(df, window=5, min_dist_factor=0.4):
+def fetch_15m():
+    try:
+        ts = td.time_series(symbol="XAU/USD", interval="15min", outputsize=120)
+        ts = ts.with_rsi().with_ema(time_period=200).with_ema(time_period=50).with_atr(time_period=14)
+        return ts.as_pandas()
+    except:
+        return None
+
+def fetch_1h():
+    try:
+        ts = td.time_series(symbol="XAU/USD", interval="1h", outputsize=60)
+        ts = ts.with_ema(time_period=200)
+        return ts.as_pandas()
+    except:
+        return None
+
+# ─── PARSE AI OUTPUT ───────────────────────────────────────────────────────
+def parse_ai_output(text):
+    if not text or not isinstance(text, str):
+        return {"verdict": "UNKNOWN", "reason": "No output"}
+
+    start = text.find('{')
+    end   = text.rfind('}') + 1
+    if start == -1 or end <= start:
+        return {"verdict": "PARSE_ERROR", "reason": "No JSON block found"}
+
+    json_str = text[start:end].strip().replace('```json', '').replace('```', '').strip()
+
+    try:
+        data = json.loads(json_str)
+        return {
+            "verdict": data.get("verdict", "UNKNOWN").upper(),
+            "reason": data.get("reason", "No reason provided"),
+            "entry": data.get("entry"),
+            "sl": data.get("sl"),
+            "tp": data.get("tp"),
+            "rr": data.get("rr"),
+            "style": data.get("style", "NONE").upper(),
+            "direction": data.get("direction", "NEUTRAL").upper(),
+            "reasoning": data.get("reasoning", "")
+        }
+    except Exception as e:
+        return {
+            "verdict": "PARSE_ERROR",
+            "reason": f"JSON parse failed: {str(e)}. Raw: {text[:120]}..."
+        }
+
+# ─── LOT SIZE CALCULATION (XAU/USD micro lots) ─────────────────────────────
+def calculate_lot_size(entry, sl, direction, balance, dd_limit, risk_of_dd_pct):
+    if not all([entry, sl, balance, dd_limit, risk_of_dd_pct]):
+        return None, "Missing data for lot size calculation"
+
+    try:
+        entry = float(entry)
+        sl = float(sl)
+        price_diff = abs(entry - sl)
+        if price_diff <= 0:
+            return None, "Invalid stop-loss distance"
+
+        max_risk_dollars = (dd_limit * risk_of_dd_pct) / 100.0
+
+        # XAU/USD: 0.01 lot = 1 oz → $1 P/L per $1 price move
+        # → lot size = max_risk_dollars / price_diff   (in 0.01 lot units? Wait)
+        # Correct formula:
+        # Risk $ = (lot size in standard lots) × price_diff × 100
+        # Because 1 standard lot = 100 oz → $100 per $1 move
+        # So lot_size_standard = max_risk_dollars / (price_diff * 100)
+        lot_size_standard = max_risk_dollars / (price_diff * 100)
+        lot_size_rounded = round(lot_size_standard, 2)  # Brokers usually allow 0.01 steps
+
+        if lot_size_rounded < 0.01:
+            lot_size_rounded = 0.01
+            note = "(minimum lot applied – actual risk lower)"
+        else:
+            note = ""
+
+        return lot_size_rounded, f"${max_risk_dollars:.2f} risk → {lot_size_rounded:.2f} lots {note}"
+    except:
+        return None, "Calculation error"
+
+# ─── MAIN ANALYSIS FUNCTION ────────────────────────────────────────────────
+def run_check():
+    with st.spinner("Fetching fresh market data..."):
+        price = get_live_price()
+        ts_15m = fetch_15m()
+        ts_1h  = fetch_1h()
+
+    if price is None:
+        st.error("Failed to fetch current gold price")
+        return
+    if ts_15m is None or ts_15m.empty:
+        st.error("No 15m data received from Twelve Data")
+        return
+
+    latest_15m = ts_15m.iloc[-1]
+    rsi = latest_15m.get('rsi', 50.0)
+    atr = latest_15m.get('atr', 10.0)
+    ema200_15m = latest_15m.get('ema_200', price)
+    ema50_15m  = latest_15m.get('ema_50',  price)
+
+    ema200_1h = ts_1h.iloc[-1].get('ema_200', price) if ts_1h is not None and not ts_1h.empty else price
+
+    # Recent fractal levels (S/R)
     levels = []
-    atr_approx = (df['high'] - df['low']).rolling(14).mean().iloc[-1]  # rough ATR proxy if needed
-    for i in range(window, len(df) - window):
-        if df['high'].iloc[i] == df['high'].iloc[i-window:i+window].max():
-            price = round(df['high'].iloc[i], 2)
-            if abs(price - df['close'].iloc[-1]) > min_dist_factor * atr_approx:
-                levels.append(('RES', price))
-        if df['low'].iloc[i] == df['low'].iloc[i-window:i+window].min():
-            price = round(df['low'].iloc[i], 2)
-            if abs(price - df['close'].iloc[-1]) > min_dist_factor * atr_approx:
-                levels.append(('SUP', price))
-    return sorted(levels, key=lambda x: x[1], reverse=True)  # sort descending price
+    for i in range(5, len(ts_15m)-5):
+        if ts_15m['high'].iloc[i] == ts_15m['high'].iloc[i-5:i+5].max():
+            levels.append(('RES', round(ts_15m['high'].iloc[i], 2)))
+        if ts_15m['low'].iloc[i] == ts_15m['low'].iloc[i-5:i+5].min():
+            levels.append(('SUP', round(ts_15m['low'].iloc[i], 2)))
 
-# ─── CACHED DATA FETCH ───────────────────────────────────────────────────────
-@st.cache_data(ttl=300)
-@retry_api()
-def fetch_15m_data():
-    return td.time_series(**{
-        "symbol": "XAU/USD",
-        "interval": "15min",
-        "outputsize": 500                      # \~5 trading days
-    }).with_rsi(**{}).with_ema(**{"time_period": 200}).with_ema(**{"time_period": 50}).with_atr(**{"time_period": 14}).as_pandas()
+    # Account info
+    balance       = st.session_state.get("balance")
+    dd_limit      = st.session_state.get("dd_limit")
+    risk_of_dd_pct = st.session_state.get("risk_of_dd_pct")
 
-@st.cache_data(ttl=300)
-@retry_api()
-def fetch_htf_data(interval):
-    out_size = 500 if interval == "5min" else 200   # 200 for 1h ≈ 8-10 days
-    return td.time_series(**{
-        "symbol": "XAU/USD",
-        "interval": interval,
-        "outputsize": out_size
-    }).with_ema(**{"time_period": 200}).as_pandas()
-
-@st.cache_data(ttl=60)
-@retry_api()
-def get_current_price():
-    return float(td.price(symbol="XAU/USD").as_json()["price"])
-
-# ─── STRUCTURED AI AUDIT ─────────────────────────────────────────────────────
-@retry_api()
-def get_ai_advice(market, setup, levels, buffer, mode):
-    levels_str = ", ".join([f"{l[0]}@{l[1]}" for l in levels[:6]]) if levels else "No clear levels"
-    current_price = market['price']
     prompt = f"""
-You are a high-conviction gold trading auditor for any account size.
-Mode: {mode} ({'standard swing (15m + 1h)' if mode == 'Standard' else 'fast scalp (15m + 5m)'}).
-Aggressive risk is user's choice — size is handled externally, do NOT suggest lots multiplier or position size changes.
-Focus on math, pullback quality, structural confluence, risk/reward.
-IMPORTANT: For buys, SL must be BELOW entry. For sells, SL must be ABOVE entry.
+You are an experienced gold (XAU/USD) trader. Analyze ONLY the provided real-time data.
+Do NOT hallucinate prices, news, levels, or external information.
 
-Current UTC time: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}
-NY session close \~22:00 UTC — factor in thinning liquidity and whipsaw risk after 21:30 UTC.
-If any high-impact news likely within ±30 min, prefer to wait unless setup is exceptionally strong.
+Current UTC: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}
 
-Current market price: ${current_price:.2f}
-Buffer left: ${buffer:.2f}
-Market: Price ${current_price:.2f}, RSI {market['rsi']:.1f}
-Original setup: {setup['type']} at ${setup['entry']:.2f}, SL distance ${setup['sl_distance']:.2f}, ATR ${setup['atr']:.2f}, risk % {setup['risk_pct']:.0f}%
-Fractals: {levels_str}
+Market data:
+Current price: ${price:.2f}
+RSI (15m): {rsi:.1f}
+ATR (15m): {atr:.2f}
+EMA50 / EMA200 (15m): {ema50_15m:.2f} / {ema200_15m:.2f}
+EMA200 (1h): {ema200_1h:.2f}
 
-Be STRICTLY consistent:
-- If original setup is low-edge, obsolete, missed, gamble, or chasing, your proposal MUST NOT re-use or slightly adjust the original entry price.
-- Any proposal MUST respect current market price ${current_price:.2f} — never suggest entries significantly below current price in bullish mode or above in bearish mode unless clear reversal evidence exists.
-- Direction must match detected bias unless verdict explicitly states "reversal".
-- Only propose changes that meaningfully improve the setup (e.g. higher entry in continuation, different SL/TP, or skip).
-- If no good alternative exists, clearly recommend skipping.
+Recent support/resistance fractals: {', '.join([f"{t}@{p}" for t,p in levels[-8:]]) or 'None'}
 
-Respond ONLY in this exact structured format. Do not add extra text.
+Account context: Balance \~\( {balance if balance else 'unknown'}, Daily DD limit \~ \){dd_limit if dd_limit else 'unknown'}
 
-VERDICT: ELITE | HIGH_CONV | LOW_EDGE | GAMBLE | SKIP
-REASON: [short explanation, 1-2 sentences]
-PROPOSAL: [entry price] | [SL price] | [TP price] | [RR ratio e.g. 2.5] | [direction: BULLISH/BEARISH/NEUTRAL] | [reasoning, 1-2 sentences]
-or
-PROPOSAL: NONE
+Identify the best realistic trading setup available right now — even if the edge is only moderate.
+Always propose concrete entry, SL, TP, RR unless the market has truly no structure or direction (very flat/range-bound).
+Be objective and favor probability over aggression.
+
+Verdict levels (use these exactly):
+- ELITE
+- HIGH_CONV
+- MODERATE
+- LOW_EDGE
+
+Respond **ONLY** with valid JSON. No extra text, no fences, no explanations outside JSON:
+
+{{
+  "verdict": "ELITE" | "HIGH_CONV" | "MODERATE" | "LOW_EDGE",
+  "reason": "one sentence explaining edge strength",
+  "entry": number or null,
+  "sl": number or null,
+  "tp": number or null,
+  "rr": number or null,
+  "style": "SCALP" | "SWING" | "BREAKOUT" | "REVERSAL" | "RANGE" | "NONE",
+  "direction": "BULLISH" | "BEARISH" | "NEUTRAL",
+  "reasoning": "1-2 sentences explaining the setup"
+}}
 """
 
-    try:
-        g_out = gemini_model.generate_content(prompt).text.strip()
-    except:
-        g_out = "VERDICT: SKIP\nREASON: Gemini Offline.\nPROPOSAL: NONE"
+    with st.spinner("Consulting AIs..."):
+        g_raw = k_raw = c_raw = '{"verdict":"ERROR","reason":"AI offline"}'
 
-    try:
-        r = grok_client.chat.completions.create(
-            model="grok-4",
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=220
-        )
-        k_out = r.choices[0].message.content.strip()
-    except Exception as e:
-        k_out = f"VERDICT: SKIP\nREASON: Grok Error: {e}\nPROPOSAL: NONE"
-
-    try:
-        response = openai_client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=220,
-            temperature=0.65
-        )
-        c_out = response.choices[0].message.content.strip()
-    except Exception as e:
-        c_out = f"VERDICT: SKIP\nREASON: ChatGPT Error: {e}\nPROPOSAL: NONE"
-
-    return g_out, k_out, c_out
-
-# ─── PARSE ───────────────────────────────────────────────────────────────────
-def parse_ai_output(text):
-    verdict = "UNKNOWN"
-    reason = ""
-    proposal = "NONE"
-    entry = sl = tp = rr = None
-    direction = None
-
-    v_match = re.search(r"VERDICT:\s*(\w+)", text, re.IGNORECASE)
-    if v_match:
-        verdict = v_match.group(1).upper()
-
-    r_match = re.search(r"REASON:\s*(.+?)(?=PROPOSAL:|$)", text, re.DOTALL | re.IGNORECASE)
-    if r_match:
-        reason = r_match.group(1).strip()
-
-    p_match = re.search(r"PROPOSAL:\s*(.+)", text, re.DOTALL | re.IGNORECASE)
-    if p_match:
-        proposal_raw = p_match.group(1).strip()
-        if proposal_raw.upper() != "NONE":
-            parts = [p.strip() for p in proposal_raw.split("|")]
-            if len(parts) >= 5:
-                try:
-                    entry = float(parts[0])
-                    sl = float(parts[1])
-                    tp = float(parts[2])
-                    rr = float(parts[3])
-                    direction = parts[4].strip().upper()
-                    proposal = "PROPOSAL"
-                except:
-                    pass
-
-    return {
-        "verdict": verdict,
-        "reason": reason,
-        "proposal": proposal,
-        "entry": entry,
-        "sl": sl,
-        "tp": tp,
-        "rr": rr,
-        "direction": direction
-    }
-
-# ─── APP ─────────────────────────────────────────────────────────────────────
-st.set_page_config(page_title="Gold Sentinel Pro", page_icon="🥇", layout="wide")
-st.title("🥇 Gold Sentinel – High Conviction Gold Entries")
-st.caption(f"Adaptive pullback engine | {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
-
-# ─── SESSION STATE ───────────────────────────────────────────────────────────
-if "analysis_done" not in st.session_state:
-    st.session_state.analysis_done = False
-    st.session_state.balance = None
-    st.session_state.daily_limit = None
-    st.session_state.floor = 0.0
-    st.session_state.risk_pct = 25
-    st.session_state.mode = "Standard"
-    st.session_state.last_analysis = 0
-
-if "saved_setups" not in st.session_state:
-    st.session_state.saved_setups = []
-
-# ─── INPUTS ──────────────────────────────────────────────────────────────────
-if not st.session_state.analysis_done:
-    st.header("Account Settings")
-    col1, col2 = st.columns(2)
-    with col1:
-        st.session_state.balance = st.number_input(
-            "Current Balance ($)", min_value=0.0, value=st.session_state.balance or 10000.0,
-            placeholder="Required", format="%.2f", key="balance_input"
-        )
-    with col2:
-        st.session_state.daily_limit = st.number_input(
-            "Daily Drawdown Limit ($)", min_value=0.0, value=st.session_state.daily_limit,
-            placeholder="Optional (set to balance for no limit)", format="%.2f"
-        )
-
-    st.session_state.floor = st.number_input(
-        "Survival Floor / Max DD ($)", value=st.session_state.floor, format="%.2f"
-    )
-
-    st.session_state.risk_pct = st.slider(
-        "Risk % of Available Buffer", 5, 50, st.session_state.risk_pct, step=5
-    )
-
-    st.session_state.mode = st.radio(
-        "Analysis Mode",
-        ["Standard (Swing – 15m + 1h alignment)", "Scalp (Fast – 15m + 5m alignment)"],
-        index=0 if st.session_state.mode == "Standard" else 1
-    )
-
-    if st.button("🚀 Analyze & Suggest", type="primary", use_container_width=True):
-        if st.session_state.balance is None or st.session_state.balance <= 0:
-            st.error("❌ Enter valid current balance")
-        elif time.time() - st.session_state.last_analysis < 60:
-            st.warning("⏳ Wait 60s between analyses (rate limits)")
-        else:
-            st.session_state.last_analysis = time.time()
-            st.session_state.analysis_done = True
-            st.rerun()
-else:
-    st.info("Analysis locked with your settings:")
-    cols = st.columns(5)
-    cols[0].metric("Balance", f"${st.session_state.balance:.2f}")
-    cols[1].metric("Daily Limit", f"${st.session_state.daily_limit:.2f}" if st.session_state.daily_limit else "No limit")
-    cols[2].metric("Floor", f"${st.session_state.floor:.2f}")
-    cols[3].metric("Risk %", f"{st.session_state.risk_pct}%")
-    cols[4].metric("Mode", st.session_state.mode.split(" – ")[0])
-
-    utc_now = datetime.now(timezone.utc)
-    is_late_session = utc_now.hour >= 21 and utc_now.hour < 23  # rough NY fade
-
-    if is_late_session:
-        st.warning("⚠️ Late NY session (after \~21:30 UTC) — thinning liquidity, higher whipsaw risk. Consider waiting for London open unless setup is very strong.")
-
-    with st.spinner("Scanning structure..."):
         try:
-            live_price = get_current_price()
-
-            ts_15m = fetch_15m_data()
-            interval = "1h" if st.session_state.mode.startswith("Standard") else "5min"
-            ts_htf = fetch_htf_data(interval)
-            htf_label = "1H" if interval == "1h" else "5M"
-
-            latest_15m = ts_15m.iloc[-1]
-            latest_htf = ts_htf.iloc[-1]
-
-            rsi = latest_15m.get('rsi', 50.0)
-            atr = latest_15m.get('atr', 0.0) or 10.0  # fallback
-
-            ema_cols_15m = sorted([c for c in ts_15m.columns if 'ema' in c.lower()])
-            ema200_15m = latest_15m[ema_cols_15m[0]] if ema_cols_15m else live_price
-            ema50_15m  = latest_15m[ema_cols_15m[1]] if len(ema_cols_15m) >= 2 else live_price
-
-            ema_cols_htf = [c for c in ts_htf.columns if 'ema' in c.lower()]
-            ema200_htf = latest_htf[sorted(ema_cols_htf)[0]] if ema_cols_htf else live_price
-
-            # Trend alignment
-            aligned = (live_price > ema200_15m and live_price > ema200_htf) or \
-                      (live_price < ema200_15m and live_price < ema200_htf)
-
-            if not aligned:
-                st.warning(f"Trend misalignment – {htf_label} EMA200 at ${ema200_htf:.2f}")
-                st.markdown("**Explanation:** 15m and HTF trends conflict → avoid counter-trend trades.")
-                st.markdown("**Action:** Wait \~15–30 min and re-analyze.")
-                st.stop()
-
-            bias = "BULLISH" if live_price > ema200_15m else "BEARISH"
-
-            # Filtered fractals
-            levels = get_fractal_levels(ts_15m, min_dist_factor=0.4)
-            resistances = sorted([l[1] for l in levels if l[0] == 'RES' and l[1] > live_price])
-            supports    = sorted([l[1] for l in levels if l[0] == 'SUP' and l[1] < live_price], reverse=True)
-
-            # Original setup (fallback)
-            sl_dist = round(atr * 1.5, 2)
-            min_sl_distance = atr * 0.4
-            min_rr = 1.2
-
-            if bias == "BULLISH":
-                original_entry = ema50_15m if (live_price - ema50_15m) > (atr * 0.5) else live_price
-                valid_sup = [s for s in supports if s < original_entry]
-                candidate_sl = valid_sup[0] - (0.3 * atr) if valid_sup else original_entry - sl_dist
-                original_sl = min(candidate_sl, original_entry - min_sl_distance)
-                original_tp = resistances[0] if resistances else original_entry + (sl_dist * 2.5)
-                original_action = "BUY AT MARKET" if original_entry == live_price else "BUY LIMIT ORDER"
-            else:
-                original_entry = ema50_15m if (ema50_15m - live_price) > (atr * 0.5) else live_price
-                valid_res = [r for r in resistances if r > original_entry]
-                candidate_sl = valid_res[0] + (0.3 * atr) if valid_res else original_entry + sl_dist
-                original_sl = max(candidate_sl, original_entry + min_sl_distance)
-                original_tp = supports[0] if supports else original_entry - (sl_dist * 2.5)
-                original_action = "SELL AT MARKET" if original_entry == live_price else "SELL LIMIT ORDER"
-
-            # Risk early
-            buffer = st.session_state.balance - st.session_state.floor
-            cash_risk = min(buffer * (st.session_state.risk_pct / 100), st.session_state.daily_limit or buffer)
-
-            min_risk_vol = atr * 100 * 0.01 * 2
-            min_risk_pct = buffer * 0.005
-            min_risk_hard = 10
-            min_risk_overall = max(min_risk_vol, min_risk_pct, min_risk_hard)
-
-            # Triple AI
-            st.divider()
-            st.subheader("Triple AI Opinions")
-            market = {"price": live_price, "rsi": rsi}
-            setup = {
-                "type": bias,
-                "entry": original_entry,
-                "sl_distance": abs(original_entry - original_sl),
-                "atr": atr,
-                "risk_pct": st.session_state.risk_pct,
-                "risk": cash_risk
-            }
-            g_verdict, k_verdict, c_verdict = get_ai_advice(market, setup, levels, buffer, st.session_state.mode)
-
-            g_parsed = parse_ai_output(g_verdict)
-            k_parsed = parse_ai_output(k_verdict)
-            c_parsed = parse_ai_output(c_verdict)
-
-            col1, col2, col3 = st.columns(3)
-            with col1: st.markdown("**Gemini**"); st.info(g_verdict)
-            with col2: st.markdown("**Grok**"); st.info(k_verdict)
-            with col3: st.markdown("**ChatGPT**"); st.info(c_verdict)
-
-            # Consensus
-            parsed_verdicts = [g_parsed["verdict"], k_parsed["verdict"], c_parsed["verdict"]]
-            elite_count = sum(1 for v in parsed_verdicts if v in ["ELITE", "HIGH_CONV"])
-            skip_count = sum(1 for v in parsed_verdicts if v == "SKIP")
-
-            if elite_count == 3:
-                st.success("3/3 High Conviction – Strongest signal")
-            elif elite_count == 2:
-                st.info("2/3 High Conviction – Reasonable confidence")
-            elif skip_count == 3:
-                st.error("3/3 Skip – No high-conviction trade")
-            elif skip_count == 2:
-                st.warning("2/3 Skip – Caution advised")
-            else:
-                st.markdown("<div style='padding:10px; background:#555; color:white; border-radius:5px;'>Mixed consensus – Review or skip</div>", unsafe_allow_html=True)
-
-            # Proposal override + validation
-            proposals = [p for p in [g_parsed, k_parsed, c_parsed] if p["proposal"] != "NONE" and p["entry"] is not None]
-            final_entry = original_entry
-            final_sl = original_sl
-            final_tp = original_tp
-            final_action = original_action
-            override_applied = False
-
-            if len(proposals) >= 2:
-                entries = [p["entry"] for p in proposals]
-                directions = [p["direction"] for p in proposals if p["direction"]]
-                if len(set(directions)) == 1:
-                    entry_spread = max(entries) - min(entries)
-                    if entry_spread <= 10:
-                        avg_entry = np.mean(entries)
-                        avg_sl = np.mean([p["sl"] for p in proposals if p["sl"] is not None])
-                        avg_tp = np.mean([p["tp"] for p in proposals if p["tp"] is not None])
-                        # Validate direction after avg
-                        valid = (bias == "BULLISH" and avg_sl < avg_entry) or (bias == "BEARISH" and avg_sl > avg_entry)
-                        if valid:
-                            final_entry = avg_entry
-                            final_sl = avg_sl
-                            final_tp = avg_tp
-                            final_action = "BUY LIMIT ORDER" if directions[0] == "BULLISH" else "SELL LIMIT ORDER"
-                            override_applied = True
-                            st.success(f"AI Consensus Override ({len(proposals)} proposals) – Averaged levels applied")
-                        else:
-                            st.warning("AI override created invalid SL direction — using original setup")
-
-            # Final calc & display
-            risk_dist = abs(final_entry - final_sl)
-            reward_dist = abs(final_tp - final_entry)
-            actual_rr = reward_dist / risk_dist if risk_dist > 0 else 0.0
-
-            risk_per_lot = (risk_dist + SPREAD_BUFFER_POINTS + SLIPPAGE_BUFFER_POINTS) * PIP_VALUE
-            lots = cash_risk / risk_per_lot
-            lots = max(0.01, round(lots / 0.01) * 0.01)  # nearest 0.01
-            actual_risk = lots * risk_per_lot
-
-            setup_valid = True
-            warning_msgs = []
-
-            if cash_risk < min_risk_overall:
-                warning_msgs.append(f"Risk too small (${cash_risk:.2f} < dynamic min ${min_risk_overall:.2f})")
-                setup_valid = False
-            if not ((bias == "BULLISH" and final_sl < final_entry) or (bias == "BEARISH" and final_sl > final_entry)):
-                warning_msgs.append("Invalid risk direction")
-                setup_valid = False
-            if actual_rr < min_rr:
-                warning_msgs.append(f"R:R too low ({actual_rr:.2f}:1)")
-                setup_valid = False
-
-            if setup_valid:
-                st.divider()
-                st.markdown(f"### {final_action}")
-                with st.container(border=True):
-                    st.metric("Entry", f"${final_entry:.2f}")
-                    col_sl, col_tp = st.columns(2)
-                    col_sl.metric("Stop Loss", f"${final_sl:.2f}")
-                    col_tp.metric("Take Profit", f"${final_tp:.2f}")
-                    col_lots, col_risk = st.columns(2)
-                    col_lots.metric("Lots", f"{lots:.2f}")
-                    col_risk.metric("Risk Amount", f"${actual_risk:.2f}")
-                    st.metric("Actual R:R", f"1:{actual_rr:.2f}")
-
-                if override_applied:
-                    st.caption("R:R shown reflects AI-averaged levels")
-
-            else:
-                st.warning("Setup rejected:\n" + "\n".join(warning_msgs))
-
-            with st.expander("Detected Fractal Levels (filtered)"):
-                st.write("**Resistance above:**", resistances[:4] or "None nearby")
-                st.write("**Support below:**", supports[:4] or "None nearby")
-
-            if st.button("✅ Accept This Setup"):
-                st.success("Setup accepted! (Add notification logic in future versions)")
-
+            g_raw = gemini_model.generate_content(prompt).text.strip()
         except Exception as e:
-            st.error(f"Analysis error: {e}")
-            if st.button("Retry Analysis"):
-                st.rerun()
+            st.warning(f"Gemini error: {e}")
+
+        try:
+            r = grok_client.chat.completions.create(
+                model="grok-beta",  # or "grok-4" if available
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=350,
+                temperature=0.5
+            )
+            k_raw = r.choices[0].message.content.strip()
+        except Exception as e:
+            st.warning(f"Grok error: {e}")
+
+        try:
+            resp = openai_client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=350,
+                temperature=0.6
+            )
+            c_raw = resp.choices[0].message.content.strip()
+        except Exception as e:
+            st.warning(f"ChatGPT error: {e}")
+
+    g_p = parse_ai_output(g_raw)
+    k_p = parse_ai_output(k_raw)
+    c_p = parse_ai_output(c_raw)
+
+    high_count = sum(1 for p in [g_p, k_p, c_p] if p["verdict"] in ["ELITE", "HIGH_CONV"])
+
+    # Select "best" for consensus lot size
+    best_p = max([g_p, k_p, c_p], key=lambda p: {"ELITE":4, "HIGH_CONV":3, "MODERATE":2, "LOW_EDGE":1, "UNKNOWN":0, "PARSE_ERROR":0}.get(p["verdict"], 0))
+
+    lot_size, lot_note = calculate_lot_size(
+        best_p.get("entry"), best_p.get("sl"), best_p.get("direction"),
+        balance, dd_limit, risk_of_dd_pct
+    )
+
+    # ─── DISPLAY VERDICTS ──────────────────────────────────────────────────────
+    st.divider()
+    st.subheader("AI Analysis Results")
+
+    def format_verdict(p, ai_name, consensus_lot=None, consensus_note=None):
+        if p["verdict"] == "PARSE_ERROR":
+            return f"**{ai_name}** — Parse error: {p['reason']}"
+
+        verdict = p["verdict"]
+        colors = {
+            "ELITE": "#2ecc71", "HIGH_CONV": "#3498db", "MODERATE": "#f1c40f",
+            "LOW_EDGE": "#e67e22", "PARSE_ERROR": "#7f8c8d", "UNKNOWN": "#95a5a6"
+        }
+        color = colors.get(verdict, "#7f8c8d")
+
+        entry = f"${p['entry']:.2f}" if p["entry"] else "—"
+        sl    = f"${p['sl']:.2f}"    if p["sl"]    else "—"
+        tp    = f"${p['tp']:.2f}"    if p["tp"]    else "—"
+        rr    = f"1:{p['rr']:.1f}"   if p["rr"]    else "—"
+
+        lot_str = consensus_lot if consensus_lot else "—"
+        note_str = consensus_note or ""
+
+        html = f"""
+        <div style="background:{color}11; border-left:5px solid {color}; padding:16px 20px; margin:12px 0; border-radius:8px; box-shadow:0 2px 8px rgba(0,0,0,0.1);">
+            <div style="font-size:1.3em; font-weight:bold; color:{color}; margin-bottom:8px;">
+                {ai_name} — {verdict}
+            </div>
+            <div style="margin-bottom:12px; color:#555;">{p['reason']}</div>
+            <div style="display:grid; grid-template-columns:1fr 1fr; gap:12px; margin:12px 0;">
+                <div><strong>Direction:</strong> {p['direction']}</div>
+                <div><strong>Style:</strong> {p['style']}</div>
+                <div><strong>Entry:</strong> {entry}</div>
+                <div><strong>SL:</strong> {sl}</div>
+                <div><strong>TP:</strong> {tp}</div>
+                <div><strong>RR:</strong> {rr}</div>
+            </div>
+            <div style="margin-top:8px; font-weight:bold;">Suggested lot: {lot_str}</div>
+            <div style="color:#555; font-size:0.9em;">{note_str}</div>
+            <div style="font-style:italic; color:#444; margin-top:12px;">{p['reasoning']}</div>
+        </div>
+        """
+        return html
+
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.markdown(format_verdict(g_p, "Gemini", lot_size, lot_note), unsafe_allow_html=True)
+    with col2:
+        st.markdown(format_verdict(k_p, "Grok", lot_size, lot_note), unsafe_allow_html=True)
+    with col3:
+        st.markdown(format_verdict(c_p, "ChatGPT", lot_size, lot_note), unsafe_allow_html=True)
+
+    # ─── CONSENSUS & TELEGRAM ──────────────────────────────────────────────────
+    if high_count >= 2:
+        entries = [p["entry"] for p in [g_p, k_p, c_p] if p["entry"] is not None]
+        consensus_note = ""
+        if len(entries) >= 2:
+            spread = max(entries) - min(entries)
+            if spread <= atr * 0.8:
+                median_entry = np.median(entries)
+                consensus_note = f"\nConsensus entry (tight cluster): ${median_entry:.2f}"
+            else:
+                consensus_note = "\nEntries spread out — review individually"
+
+        msg = (
+            f"**High Conviction Consensus ({high_count}/3 AIs)**\n"
+            f"Direction: {best_p['direction']}\n"
+            f"Style: {best_p['style']}\n"
+            f"Entry: ${best_p['entry']:.2f}\n"
+            f"SL: ${best_p['sl']:.2f}\n"
+            f"TP: ${best_p['tp']:.2f} (RR \~1:{best_p['rr']})\n"
+            f"Reason: {best_p['reason']}{consensus_note}\n"
+        )
+        if lot_size:
+            msg += f"\nSuggested lot: {lot_size:.2f} lots ({lot_note})"
+
+        priority = "high" if high_count == 3 else "normal"
+        send_telegram(msg, priority=priority)
+        st.success(f"High conviction consensus detected ({high_count}/3) — Telegram sent!")
+    else:
+        st.info("No strong consensus (need at least 2/3 ELITE or HIGH_CONV) — no alert sent.")
+
+# ─── UI ─────────────────────────────────────────────────────────────────────
+st.set_page_config(page_title="Gold Sentinel", page_icon="🥇", layout="wide")
+st.title("🥇 Gold Sentinel – Multi-AI Gold Trading Setups")
+st.caption(f"Gemini • Grok • ChatGPT | {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
+
+# Prop / Account settings
+with st.expander("Prop Challenge & Risk Settings", expanded=True):
+    col_a, col_b, col_c = st.columns(3)
+    with col_a:
+        balance = st.number_input("Current Balance ($)", min_value=0.0, step=0.01, value=5029.00, format="%.2f")
+    with col_b:
+        dd_limit = st.number_input("Daily Drawdown Limit ($)", min_value=0.0, step=1.0, value=251.45,
+                                   help="Usually 5% of evaluation balance or current balance", format="%.2f")
+    with col_c:
+        risk_of_dd_pct = st.number_input("Max risk % of Daily DD per trade", min_value=1, max_value=100, step=5, value=20,
+                                         help="10–30% typical – keeps you safe while allowing reasonable position sizing")
+
+    if st.button("Save Risk Settings", use_container_width=True):
+        st.session_state.balance = balance
+        st.session_state.dd_limit = dd_limit
+        st.session_state.risk_of_dd_pct = risk_of_dd_pct
+        st.success("Risk settings saved!")
+
+# Auto / Manual run
+auto_enabled = st.checkbox("Auto-run every 15 minutes (keep tab open)", value=False)
+
+if "last_check" not in st.session_state:
+    st.session_state.last_check = 0
+
+if auto_enabled:
+    now = time.time()
+    elapsed = now - st.session_state.last_check
+    if elapsed >= CHECK_INTERVAL_MIN * 60:
+        st.session_state.last_check = now
+        st.info(f"Auto-running analysis... (last run {int(elapsed//60)} min ago)")
+        run_check()
+    else:
+        remaining = CHECK_INTERVAL_MIN * 60 - elapsed
+        mins, secs = divmod(int(remaining), 60)
+        st.caption(f"Next auto-run in {mins} min {secs} sec (tab must stay active)")
+else:
+    st.info("Auto mode off – use button below to run manually")
+
+if st.button("📡 Run Analysis Now (\~8–12 credits)", type="primary", use_container_width=True):
+    run_check()
