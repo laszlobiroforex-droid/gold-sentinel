@@ -367,3 +367,4 @@ else:
 
 if st.button("📡 Run Analysis Now", type="primary", use_container_width=True):
     run_check()
+
