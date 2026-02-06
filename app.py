@@ -9,7 +9,7 @@ import requests
 import numpy as np
 
 # ─── CONFIG ────────────────────────────────────────────────────────────────
-CHECK_INTERVAL_MIN = 15
+CHECK_INTERVAL_MIN = 30
 
 # ─── API INIT ──────────────────────────────────────────────────────────────
 td = TDClient(apikey=st.secrets["TWELVE_DATA_KEY"])
