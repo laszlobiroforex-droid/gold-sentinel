@@ -9,7 +9,7 @@ import requests
 import numpy as np
 
 # ─── CONFIG ────────────────────────────────────────────────────────────────
-CHECK_INTERVAL_MIN = 30  # your current setting (every 30 min)
+CHECK_INTERVAL_MIN = 30
 
 # ─── API INIT ──────────────────────────────────────────────────────────────
 td = TDClient(apikey=st.secrets["TWELVE_DATA_KEY"])
@@ -24,7 +24,7 @@ def send_telegram(message, priority="normal"):
     token   = st.secrets.get("TELEGRAM_BOT_TOKEN")
     chat_id = st.secrets.get("TELEGRAM_CHAT_ID")
     if not token or not chat_id:
-        st.warning("Telegram not configured (missing token or chat ID)")
+        st.warning("Telegram not configured")
         return
 
     emoji = "🟢 ELITE" if priority == "high" else "🔵 Conviction"
@@ -95,7 +95,7 @@ def parse_ai_output(text):
             "reason": f"Invalid JSON: {str(e)}. Raw: {text[:150]}..."
         }
 
-# ─── FALLBACK LOT CALC (if AI doesn't provide) ─────────────────────────────
+# ─── FALLBACK LOT CALC ─────────────────────────────────────────────────────
 def calculate_lot_size(entry, sl, balance, dd_limit, risk_of_dd_pct):
     if not all(v is not None for v in [entry, sl, balance, dd_limit, risk_of_dd_pct]):
         return None, "Missing data for lot calc"
@@ -142,8 +142,9 @@ def run_check():
 
     ema200_1h = ts_1h.iloc[-1].get('ema_200', price) if ts_1h is not None and not ts_1h.empty else price
 
+    # Limit fractals to recent candles to avoid old levels
     levels = []
-    for i in range(5, len(ts_15m)-5):
+    for i in range(5, min(40, len(ts_15m)-5)):
         if ts_15m['high'].iloc[i] == ts_15m['high'].iloc[i-5:i+5].max():
             levels.append(('RES', round(ts_15m['high'].iloc[i], 2)))
         if ts_15m['low'].iloc[i] == ts_15m['low'].iloc[i-5:i+5].min():
@@ -157,6 +158,8 @@ def run_check():
 
     prompt = f"""
 You are a disciplined, high-probability gold (XAU/USD) trader focused on capital preservation, precise entries, and waiting for confirmation.
+
+Current live price is ${price:.2f} — ALL levels, entries, SL, TP MUST be realistic relative to this price. Never suggest entries/SL/TP hundreds or thousands away from current price.
 
 Account risk guidelines (preferred but not absolute hard cap):
 - Current balance ≈ ${balance if balance else 'unknown'}
@@ -217,7 +220,7 @@ Always be transparent about risk — never silently exceed the preferred limit.
         g_raw = k_raw = c_raw = '{"verdict":"ERROR","reason":"AI offline"}'
 
         try:
-            g_raw = gemini_model.generate_content(prompt).text.strip()
+            g_raw = gemini_model.generate_content(prompt, generation_config={"temperature": 0.2}).text.strip()
         except Exception as e:
             st.warning(f"Gemini failed: {str(e)}")
 
@@ -249,11 +252,8 @@ Always be transparent about risk — never silently exceed the preferred limit.
 
     high_count = sum(1 for p in [g_p, k_p, c_p] if p["verdict"] in ["ELITE", "HIGH_CONV"])
 
-    # Select best for consensus
-    verdict_scores = {"ELITE": 4, "HIGH_CONV": 3, "MODERATE": 2, "LOW_EDGE": 1, "NO_EDGE": -1}
-    best_p = max([g_p, k_p, c_p], key=lambda p: verdict_scores.get(p["verdict"], 0))
+    best_p = max([g_p, k_p, c_p], key=lambda p: {"ELITE":4, "HIGH_CONV":3, "MODERATE":2, "LOW_EDGE":1, "NO_EDGE":-1}.get(p["verdict"], 0))
 
-    # Lot: prefer AI suggestion, fallback to calc
     lot_size = best_p.get("suggested_lot")
     lot_note = None
     if lot_size is not None:
@@ -283,13 +283,33 @@ Always be transparent about risk — never silently exceed the preferred limit.
         }
         color = colors.get(verdict, "#7f8c8d")
 
-        entry_str = f"{p['entry_type']} @ ${p['entry_price']:.2f}" if p.get("entry_type") and p.get("entry_price") else "—"
-        sl_str    = f"${p['sl']:.2f}" if p.get("sl") else "—"
-        tp_str    = f"${p['tp']:.2f}" if p.get("tp") else "—"
-        rr_str    = f"1:{p['rr']:.1f}" if p.get("rr") else "—"
-        prob_str  = f"{p['estimated_win_prob']}%" if p.get("estimated_win_prob") else "—"
-        risk_str  = f"${p.get('risk_dollars', '—'):.2f} ({p.get('risk_pct_of_dd', '—'):.1f}% of DD)"
-        exceed_warning = '<span style="color:#e74c3c; font-weight:bold;">EXCEEDS preferred risk!</span>' if p.get("exceeds_preferred_risk") else ""
+        entry_str = f"{p.get('entry_type', '—')} @ ${p.get('entry_price', '—'):.2f}"
+        sl_str    = f"${p.get('sl', '—'):.2f}"
+        tp_str    = f"${p.get('tp', '—'):.2f}"
+        rr_str    = f"1:{p.get('rr', '—'):.1f}"
+        prob_str  = f"{p.get('estimated_win_prob', '—')}%"
+
+        # Safe risk formatting
+        risk_dollars_val = p.get('risk_dollars')
+        risk_pct_val     = p.get('risk_pct_of_dd')
+        exceed_flag      = p.get('exceeds_preferred_risk', False)
+
+        if isinstance(risk_dollars_val, (int, float)):
+            dollars_part = f"${risk_dollars_val:.2f}"
+        else:
+            dollars_part = "—"
+
+        if isinstance(risk_pct_val, (int, float)):
+            pct_part = f"{risk_pct_val:.1f}%"
+        else:
+            pct_part = "—"
+
+        risk_str = f"{dollars_part} ({pct_part} of DD)"
+        exceed_warning = '<span style="color:#e74c3c; font-weight:bold;">EXCEEDS preferred risk!</span>' if exceed_flag else ""
+
+        # Sanity check entry distance
+        if p.get('entry_price') and price and abs(p['entry_price'] - price) / price > 0.10:
+            entry_str += ' <span style="color:#e74c3c;">(unrealistic distance!)</span>'
 
         html = f"""
         <div style="background:{color}11; border-left:5px solid {color}; padding:16px 20px; margin:16px 0; border-radius:8px; box-shadow:0 2px 8px rgba(0,0,0,0.1);">
@@ -338,10 +358,10 @@ Always be transparent about risk — never silently exceed the preferred limit.
             f"**Consensus High Conviction ({high_count}/3)**\n"
             f"Direction: {best_p['direction']}\n"
             f"Style: {best_p['style']}\n"
-            f"Entry: {best_p['entry_type']} @ ${best_p.get('entry_price', best_p.get('entry', '—')):.2f}\n"
-            f"SL: ${best_p['sl']:.2f}\n"
-            f"TP: ${best_p['tp']:.2f} (RR \~1:{best_p['rr']})\n"
-            f"Est. Win Prob: {best_p['estimated_win_prob']}%\n"
+            f"Entry: {best_p.get('entry_type', '—')} @ ${best_p.get('entry_price', best_p.get('entry', '—')):.2f}\n"
+            f"SL: ${best_p.get('sl', '—'):.2f}\n"
+            f"TP: ${best_p.get('tp', '—'):.2f} (RR \~1:{best_p.get('rr', '—')})\n"
+            f"Est. Win Prob: {best_p.get('estimated_win_prob', '—')}%\n"
             f"Reason: {best_p['reason']}{consensus_note}{exceed_text}\n"
         )
         if lot_size:
@@ -358,7 +378,6 @@ st.set_page_config(page_title="Gold Sentinel", page_icon="🥇", layout="wide")
 st.title("🥇 Gold Sentinel – AI-Driven Gold Setups")
 st.caption(f"Gemini • Grok • ChatGPT | {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
 
-# ─── RISK SETTINGS ──────────────────────────────────────────────────────────
 with st.expander("Prop Challenge / Risk Settings (required for lot sizing)", expanded=True):
     default_balance = st.session_state.get("balance", 5029.00)
     default_dd = st.session_state.get("dd_limit", 251.45)
@@ -379,7 +398,6 @@ with st.expander("Prop Challenge / Risk Settings (required for lot sizing)", exp
         st.success("Settings saved!")
         st.rerun()
 
-# ─── AUTO / MANUAL CONTROLS ────────────────────────────────────────────────
 if "last_check_time" not in st.session_state:
     st.session_state.last_check_time = 0
 
