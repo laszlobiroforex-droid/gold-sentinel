@@ -9,7 +9,7 @@ import requests
 import numpy as np
 
 # ─── CONFIG ────────────────────────────────────────────────────────────────
-CHECK_INTERVAL_MIN = 30
+CHECK_INTERVAL_MIN = 30  # your current setting (every 30 min)
 
 # ─── API INIT ──────────────────────────────────────────────────────────────
 td = TDClient(apikey=st.secrets["TWELVE_DATA_KEY"])
@@ -24,7 +24,7 @@ def send_telegram(message, priority="normal"):
     token   = st.secrets.get("TELEGRAM_BOT_TOKEN")
     chat_id = st.secrets.get("TELEGRAM_CHAT_ID")
     if not token or not chat_id:
-        st.warning("Telegram not configured (TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID missing in secrets)")
+        st.warning("Telegram not configured (missing token or chat ID)")
         return
 
     emoji = "🟢 ELITE" if priority == "high" else "🔵 Conviction"
@@ -75,10 +75,16 @@ def parse_ai_output(text):
         return {
             "verdict": data.get("verdict", "UNKNOWN").upper(),
             "reason": data.get("reason", "No reason"),
-            "entry": data.get("entry"),
+            "entry_type": data.get("entry_type"),
+            "entry_price": data.get("entry_price"),
             "sl": data.get("sl"),
             "tp": data.get("tp"),
             "rr": data.get("rr"),
+            "estimated_win_prob": data.get("estimated_win_prob"),
+            "suggested_lot": data.get("suggested_lot"),
+            "risk_dollars": data.get("risk_dollars"),
+            "risk_pct_of_dd": data.get("risk_pct_of_dd"),
+            "exceeds_preferred_risk": data.get("exceeds_preferred_risk", False),
             "style": data.get("style", "NONE").upper(),
             "direction": data.get("direction", "NEUTRAL").upper(),
             "reasoning": data.get("reasoning", "")
@@ -89,35 +95,32 @@ def parse_ai_output(text):
             "reason": f"Invalid JSON: {str(e)}. Raw: {text[:150]}..."
         }
 
-# ─── LOT SIZE CALCULATION ──────────────────────────────────────────────────
+# ─── FALLBACK LOT CALC (if AI doesn't provide) ─────────────────────────────
 def calculate_lot_size(entry, sl, balance, dd_limit, risk_of_dd_pct):
     if not all(v is not None for v in [entry, sl, balance, dd_limit, risk_of_dd_pct]):
-        return None, "Missing data for lot calc (need entry, SL, balance, DD limit and risk %)"
+        return None, "Missing data for lot calc"
 
     try:
         entry = float(entry)
         sl = float(sl)
         price_diff = abs(entry - sl)
         if price_diff <= 0:
-            return None, "Invalid SL distance (entry == SL)"
+            return None, "Invalid SL distance"
 
         max_risk_dollars = (dd_limit * risk_of_dd_pct) / 100.0
-
-        # XAU/USD: 0.01 lot = $1 per $1 price move
-        # Risk $ = lots × price_diff × 100
         lot_size = max_risk_dollars / (price_diff * 100)
         lot_size_rounded = round(lot_size, 2)
 
         note = ""
         if lot_size_rounded < 0.01:
             lot_size_rounded = 0.01
-            note = "(minimum 0.01 lot applied – actual risk lower)"
+            note = "(min 0.01 lot – actual risk lower)"
 
         return lot_size_rounded, f"${max_risk_dollars:.2f} risk → {lot_size_rounded:.2f} lots {note}"
-    except Exception as e:
-        return None, f"Lot calc error: {str(e)}"
+    except:
+        return None, "Calc error"
 
-# ─── MAIN ANALYSIS ─────────────────────────────────────────────────────────
+# ─── MAIN CHECK ────────────────────────────────────────────────────────────
 def run_check():
     with st.spinner("Fetching market data..."):
         price = get_live_price()
@@ -150,46 +153,64 @@ def run_check():
     dd_limit       = st.session_state.get("dd_limit")
     risk_of_dd_pct = st.session_state.get("risk_of_dd_pct")
 
+    max_risk_dollars = (dd_limit * risk_of_dd_pct / 100.0) if dd_limit and risk_of_dd_pct else 0
+
     prompt = f"""
-You are an experienced gold (XAU/USD) trader. Analyze ONLY the provided real-time data.
-Do NOT hallucinate prices, news, levels, or external information.
+You are a disciplined, high-probability gold (XAU/USD) trader focused on capital preservation, precise entries, and waiting for confirmation.
 
-Current UTC: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}
+Account risk guidelines (preferred but not absolute hard cap):
+- Current balance ≈ ${balance if balance else 'unknown'}
+- Daily drawdown limit: ${dd_limit if dd_limit else 'unknown'}
+- Preferred maximum risk per trade: {risk_of_dd_pct if risk_of_dd_pct else 'unknown'}% of daily DD limit → ${max_risk_dollars:.2f} preferred max loss if stopped out
+- You MAY propose setups that exceed this preferred risk ONLY if the estimated win probability is very high (≥75–80%) and the structure is exceptionally clean
+- When exceeding: ALWAYS clearly state the actual risk % and dollars, and warn that it exceeds the user's preferred limit
 
-Market data:
-Current price: ${price:.2f}
-RSI (15m): {rsi:.1f}
-ATR (15m): {atr:.2f}
-EMA50 / EMA200 (15m): {ema50_15m:.2f} / {ema200_15m:.2f}
-EMA200 (1h): {ema200_1h:.2f}
+Core philosophy & entry style:
+- Prioritize only high-probability setups (conservative estimate ≥65–70% win rate when possible, ≥75–80% for any over-risk proposals)
+- Prefer waiting for confirmation: pullbacks to strong support/resistance (limit orders), retests after breakouts, stop orders for clean breakouts
+- The edge comes from getting filled at advantageous prices and having favorable risk-reward — NOT from forcing entries or chasing momentum
+- Accept lower RR (1:1, 0.8:1, even 0.7:1) if the setup has very high probability and clean structure
+- If a high-prob setup would require exceeding the preferred risk → still propose it, but with strong warning and exact overage calculation
+- If no high-quality setup exists (even allowing over-risk for exceptional cases) → verdict = "NO_EDGE"
 
-Recent support/resistance fractals: {', '.join([f"{t}@{p}" for t,p in levels[-8:]]) or 'None'}
+Analysis steps you must follow internally:
+1. Evaluate structure, momentum, key levels, RSI/EMA/ATR confluence, recent fractals
+2. Identify the highest-conviction setups that allow waiting for confirmation
+3. For each potential setup:
+   - Decide realistic entry type: limit (pullback), stop (breakout), or market (rare, only immediate strong edge)
+   - Set tight SL behind structure
+   - Set TP at next logical level
+   - Calculate risk in points and required lot to achieve target RR
+   - Calculate dollar risk and % of daily DD with that lot
+   - Estimate conservative win probability (technicals only)
+4. Decision rules:
+   - If win prob ≥65% AND risk ≤ preferred ${max_risk_dollars:.2f} → propose normally
+   - If win prob ≥75–80% AND setup is exceptional → propose even if risk exceeds preferred limit, but include clear warning
+   - If win prob <65% → reject unless truly outstanding (rare)
+   - Never hide over-risk — always disclose
 
-Account context: Balance \~\( {balance if balance else 'unknown'}, Daily DD limit \~ \){dd_limit if dd_limit else 'unknown'}
-
-Identify the best realistic trading setup available right now — even if the edge is only moderate.
-Always propose concrete entry, SL, TP, RR unless the market has truly no structure or direction.
-Be objective and favor probability.
-
-Verdict levels (use these exactly):
-- ELITE
-- HIGH_CONV
-- MODERATE
-- LOW_EDGE
-
-Respond **ONLY** with valid JSON. No extra text, no fences:
+Output format — respond **ONLY** with valid JSON. No extra text, no fences:
 
 {{
-  "verdict": "ELITE" | "HIGH_CONV" | "MODERATE" | "LOW_EDGE",
-  "reason": "one sentence explaining edge strength",
-  "entry": number or null,
+  "verdict": "ELITE" | "HIGH_CONV" | "MODERATE" | "LOW_EDGE" | "NO_EDGE",
+  "reason": "One sentence on edge strength, probability, and risk fit (include warning if exceeding preferred limit)",
+  "entry_type": "LIMIT" | "STOP" | "MARKET" | null,
+  "entry_price": number or null,
   "sl": number or null,
   "tp": number or null,
   "rr": number or null,
+  "estimated_win_prob": number or null,
+  "suggested_lot": number or null,
+  "risk_dollars": number or null,
+  "risk_pct_of_dd": number or null,
+  "exceeds_preferred_risk": boolean,
   "style": "SCALP" | "SWING" | "BREAKOUT" | "REVERSAL" | "RANGE" | "NONE",
   "direction": "BULLISH" | "BEARISH" | "NEUTRAL",
-  "reasoning": "1-2 sentences explaining the setup"
+  "reasoning": "2–4 sentences: structure/confluence, why waiting for pullback/breakout, probability reasoning, risk calculation & any overage warning"
 }}
+
+If no trade meets the criteria (even allowing over-risk for exceptional high-prob cases), use "NO_EDGE" and explain.
+Always be transparent about risk — never silently exceed the preferred limit.
 """
 
     with st.spinner("Consulting AIs..."):
@@ -204,7 +225,7 @@ Respond **ONLY** with valid JSON. No extra text, no fences:
             r = grok_client.chat.completions.create(
                 model="grok-4",
                 messages=[{"role": "user", "content": prompt}],
-                max_tokens=300,
+                max_tokens=400,
                 temperature=0.4
             )
             k_raw = r.choices[0].message.content.strip()
@@ -215,7 +236,7 @@ Respond **ONLY** with valid JSON. No extra text, no fences:
             resp = openai_client.chat.completions.create(
                 model="gpt-4o-mini",
                 messages=[{"role": "user", "content": prompt}],
-                max_tokens=300,
+                max_tokens=400,
                 temperature=0.5
             )
             c_raw = resp.choices[0].message.content.strip()
@@ -228,18 +249,23 @@ Respond **ONLY** with valid JSON. No extra text, no fences:
 
     high_count = sum(1 for p in [g_p, k_p, c_p] if p["verdict"] in ["ELITE", "HIGH_CONV"])
 
-    # Select best AI for consensus lot sizing
-    verdict_scores = {"ELITE": 4, "HIGH_CONV": 3, "MODERATE": 2, "LOW_EDGE": 1}
+    # Select best for consensus
+    verdict_scores = {"ELITE": 4, "HIGH_CONV": 3, "MODERATE": 2, "LOW_EDGE": 1, "NO_EDGE": -1}
     best_p = max([g_p, k_p, c_p], key=lambda p: verdict_scores.get(p["verdict"], 0))
 
-    lot_size, lot_note = calculate_lot_size(
-        best_p.get("entry"), best_p.get("sl"),
-        balance, dd_limit, risk_of_dd_pct
-    )
-
-    # Show why lot size failed (if applicable)
-    if lot_size is None and "Missing data" in lot_note:
-        st.info(f"Lot size not calculated: {lot_note}\n\nPlease fill in and save the risk settings below.")
+    # Lot: prefer AI suggestion, fallback to calc
+    lot_size = best_p.get("suggested_lot")
+    lot_note = None
+    if lot_size is not None:
+        lot_note = f"AI suggested: {lot_size:.2f} lots (${best_p.get('risk_dollars', '—')})"
+        if best_p.get("exceeds_preferred_risk"):
+            lot_note += " — EXCEEDS preferred risk!"
+    else:
+        lot_size, lot_note = calculate_lot_size(
+            best_p.get("entry_price") or best_p.get("entry"),
+            best_p.get("sl"),
+            balance, dd_limit, risk_of_dd_pct
+        )
 
     # ─── DISPLAY VERDICTS ──────────────────────────────────────────────────────
     st.divider()
@@ -253,14 +279,17 @@ Respond **ONLY** with valid JSON. No extra text, no fences:
         colors = {
             "ELITE": "#2ecc71", "HIGH_CONV": "#3498db",
             "MODERATE": "#f1c40f", "LOW_EDGE": "#e67e22",
-            "PARSE_ERROR": "#7f8c8d", "UNKNOWN": "#7f8c8d"
+            "NO_EDGE": "#95a5a6", "PARSE_ERROR": "#7f8c8d"
         }
         color = colors.get(verdict, "#7f8c8d")
 
-        entry = f"${p['entry']:.2f}" if p["entry"] is not None else "—"
-        sl    = f"${p['sl']:.2f}"    if p["sl"]    is not None else "—"
-        tp    = f"${p['tp']:.2f}"    if p["tp"]    is not None else "—"
-        rr    = f"1:{p['rr']:.1f}"   if p["rr"]    is not None else "—"
+        entry_str = f"{p['entry_type']} @ ${p['entry_price']:.2f}" if p.get("entry_type") and p.get("entry_price") else "—"
+        sl_str    = f"${p['sl']:.2f}" if p.get("sl") else "—"
+        tp_str    = f"${p['tp']:.2f}" if p.get("tp") else "—"
+        rr_str    = f"1:{p['rr']:.1f}" if p.get("rr") else "—"
+        prob_str  = f"{p['estimated_win_prob']}%" if p.get("estimated_win_prob") else "—"
+        risk_str  = f"${p.get('risk_dollars', '—'):.2f} ({p.get('risk_pct_of_dd', '—'):.1f}% of DD)"
+        exceed_warning = '<span style="color:#e74c3c; font-weight:bold;">EXCEEDS preferred risk!</span>' if p.get("exceeds_preferred_risk") else ""
 
         html = f"""
         <div style="background:{color}11; border-left:5px solid {color}; padding:16px 20px; margin:16px 0; border-radius:8px; box-shadow:0 2px 8px rgba(0,0,0,0.1);">
@@ -271,29 +300,28 @@ Respond **ONLY** with valid JSON. No extra text, no fences:
             <div style="display:grid; grid-template-columns:1fr 1fr; gap:12px; margin:12px 0;">
                 <div><strong>Direction:</strong> {p['direction']}</div>
                 <div><strong>Style:</strong> {p['style']}</div>
-                <div><strong>Entry:</strong> {entry}</div>
-                <div><strong>SL:</strong> {sl}</div>
-                <div><strong>TP:</strong> {tp}</div>
-                <div><strong>RR:</strong> {rr}</div>
+                <div><strong>Entry:</strong> {entry_str}</div>
+                <div><strong>SL:</strong> {sl_str}</div>
+                <div><strong>TP:</strong> {tp_str}</div>
+                <div><strong>RR:</strong> {rr_str}</div>
+                <div><strong>Est. Win Prob:</strong> {prob_str}</div>
+                <div><strong>Risk:</strong> {risk_str} {exceed_warning}</div>
+                <div><strong>Lot size:</strong> {lot if lot else '—'}</div>
             </div>
-            <div style="margin:12px 0; font-weight:bold; color:#2c3e50;">Lot size: {lot if lot is not None else '—'}</div>
-            <div style="color:#555; font-size:0.9em;">{note}</div>
+            <div style="color:#555; font-size:0.9em; margin:8px 0;">{note or ''}</div>
             <div style="font-style:italic; color:#444; margin-top:12px;">{p['reasoning']}</div>
         </div>
         """
         return html
 
     col1, col2, col3 = st.columns(3)
-    with col1:
-        st.markdown(format_verdict(g_p, "Gemini", lot_size, lot_note), unsafe_allow_html=True)
-    with col2:
-        st.markdown(format_verdict(k_p, "Grok", lot_size, lot_note), unsafe_allow_html=True)
-    with col3:
-        st.markdown(format_verdict(c_p, "ChatGPT", lot_size, lot_note), unsafe_allow_html=True)
+    with col1: st.markdown(format_verdict(g_p, "Gemini",   lot_size, lot_note), unsafe_allow_html=True)
+    with col2: st.markdown(format_verdict(k_p, "Grok",     lot_size, lot_note), unsafe_allow_html=True)
+    with col3: st.markdown(format_verdict(c_p, "ChatGPT",  lot_size, lot_note), unsafe_allow_html=True)
 
     # ─── CONSENSUS & TELEGRAM ──────────────────────────────────────────────────
     if high_count >= 2:
-        entries = [p["entry"] for p in [g_p, k_p, c_p] if p["entry"] is not None]
+        entries = [p.get("entry_price") or p.get("entry") for p in [g_p, k_p, c_p] if p.get("entry_price") or p.get("entry")]
         consensus_note = ""
         if len(entries) >= 2:
             spread = max(entries) - min(entries)
@@ -303,17 +331,21 @@ Respond **ONLY** with valid JSON. No extra text, no fences:
             else:
                 consensus_note = "\nEntries spread — review manually"
 
+        exceed_flag = any(p.get("exceeds_preferred_risk") for p in [g_p, k_p, c_p])
+        exceed_text = " — **EXCEEDS preferred risk on at least one AI**" if exceed_flag else ""
+
         msg = (
             f"**Consensus High Conviction ({high_count}/3)**\n"
             f"Direction: {best_p['direction']}\n"
             f"Style: {best_p['style']}\n"
-            f"Entry: ${best_p['entry']:.2f}\n"
+            f"Entry: {best_p['entry_type']} @ ${best_p.get('entry_price', best_p.get('entry', '—')):.2f}\n"
             f"SL: ${best_p['sl']:.2f}\n"
             f"TP: ${best_p['tp']:.2f} (RR \~1:{best_p['rr']})\n"
-            f"Reason: {best_p['reason']}{consensus_note}\n"
+            f"Est. Win Prob: {best_p['estimated_win_prob']}%\n"
+            f"Reason: {best_p['reason']}{consensus_note}{exceed_text}\n"
         )
-        if lot_size is not None:
-            msg += f"\nSuggested lot: {lot_size:.2f} lots ({lot_note})"
+        if lot_size:
+            msg += f"\nSuggested lot: {lot_size:.2f} ({lot_note})"
 
         priority = "high" if high_count == 3 else "normal"
         send_telegram(msg, priority=priority)
@@ -326,11 +358,11 @@ st.set_page_config(page_title="Gold Sentinel", page_icon="🥇", layout="wide")
 st.title("🥇 Gold Sentinel – AI-Driven Gold Setups")
 st.caption(f"Gemini • Grok • ChatGPT | {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
 
-# ─── RISK SETTINGS (persistent defaults) ────────────────────────────────────
+# ─── RISK SETTINGS ──────────────────────────────────────────────────────────
 with st.expander("Prop Challenge / Risk Settings (required for lot sizing)", expanded=True):
-    default_balance = st.session_state.get("balance", 0.0)
-    default_dd = st.session_state.get("dd_limit", 0.0)
-    default_risk_pct = st.session_state.get("risk_of_dd_pct", 25.0)
+    default_balance = st.session_state.get("balance", 5029.00)
+    default_dd = st.session_state.get("dd_limit", 251.45)
+    default_risk_pct = st.session_state.get("risk_of_dd_pct", 20.0)
 
     col1, col2, col3 = st.columns(3)
     with col1:
@@ -338,20 +370,20 @@ with st.expander("Prop Challenge / Risk Settings (required for lot sizing)", exp
     with col2:
         dd_input = st.number_input("Daily Drawdown Limit ($)", min_value=0.0, step=1.0, value=default_dd, format="%.2f")
     with col3:
-        risk_input = st.number_input("Accepted risk % of Daily DD", min_value=1.0, max_value=100.0, value=default_risk_pct, step=1.0, format="%.0f")
+        risk_input = st.number_input("Preferred risk % of Daily DD", min_value=1.0, max_value=100.0, value=default_risk_pct, step=1.0, format="%.0f")
 
     if st.button("Save & Apply Settings", type="primary", use_container_width=True):
         st.session_state.balance = balance_input
         st.session_state.dd_limit = dd_input
         st.session_state.risk_of_dd_pct = risk_input
-        st.success("Settings saved! Lot sizing will now work on next run.")
-        st.rerun()  # Refresh UI to show updated defaults
+        st.success("Settings saved!")
+        st.rerun()
 
 # ─── AUTO / MANUAL CONTROLS ────────────────────────────────────────────────
 if "last_check_time" not in st.session_state:
     st.session_state.last_check_time = 0
 
-auto_enabled = st.checkbox("Auto-run every 15 minutes (keep tab open)", value=False)
+auto_enabled = st.checkbox(f"Auto-run every {CHECK_INTERVAL_MIN} minutes (keep tab open)", value=False)
 
 if auto_enabled:
     now = time.time()
@@ -367,4 +399,3 @@ else:
 
 if st.button("📡 Run Analysis Now", type="primary", use_container_width=True):
     run_check()
-
