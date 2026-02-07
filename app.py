@@ -7,7 +7,7 @@ import google.generativeai as genai
 from openai import OpenAI
 import requests
 import numpy as np
-import pandas as pd  # ← added for Timestamp
+import pandas as pd
 
 # ─── CONFIG ────────────────────────────────────────────────────────────────
 CHECK_INTERVAL_MIN = 30
@@ -49,10 +49,11 @@ def fetch_15m(target_end_time=None, outputsize=200):
         ts = ts.with_rsi().with_ema(time_period=200).with_ema(time_period=50).with_atr(time_period=14)
         df = ts.as_pandas()
         if target_end_time:
-            target_pd = pd.Timestamp(target_end_time)  # ← fix: convert to pandas Timestamp
+            target_pd = pd.Timestamp(target_end_time).tz_localize(None)
+            df.index = df.index.tz_localize(None) if df.index.tz is not None else df.index
             df = df[df.index <= target_pd]
             if df.empty:
-                st.warning(f"No 15m candles ≤ {target_end_time} — try a later time or larger outputsize")
+                st.warning(f"No 15m candles ≤ {target_end_time} — try later time or larger outputsize")
         return df
     except Exception as e:
         st.warning(f"15m fetch failed: {str(e)}")
@@ -64,7 +65,8 @@ def fetch_1h(target_end_time=None, outputsize=100):
         ts = ts.with_ema(time_period=200)
         df = ts.as_pandas()
         if target_end_time:
-            target_pd = pd.Timestamp(target_end_time)  # ← fix
+            target_pd = pd.Timestamp(target_end_time).tz_localize(None)
+            df.index = df.index.tz_localize(None) if df.index.tz is not None else df.index
             df = df[df.index <= target_pd]
         return df
     except Exception as e:
@@ -144,8 +146,6 @@ def run_check(historical_end_time=None):
             st.write(f"Simulated current price: ${price:.2f}")
             if len(ts_15m) > 0:
                 st.write("Last 5 candles used:", ts_15m.tail(5)[['close', 'rsi', 'ema_50', 'ema_200', 'atr']])
-            else:
-                st.warning("No candles after slicing — data may be empty")
         else:
             price = get_live_price()
             ts_15m = fetch_15m()
