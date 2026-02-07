@@ -7,6 +7,7 @@ import google.generativeai as genai
 from openai import OpenAI
 import requests
 import numpy as np
+import pandas as pd  # ← added for Timestamp
 
 # ─── CONFIG ────────────────────────────────────────────────────────────────
 CHECK_INTERVAL_MIN = 30
@@ -48,10 +49,10 @@ def fetch_15m(target_end_time=None, outputsize=200):
         ts = ts.with_rsi().with_ema(time_period=200).with_ema(time_period=50).with_atr(time_period=14)
         df = ts.as_pandas()
         if target_end_time:
-            # Slice to only include candles up to (and including) the target time
-            df = df[df.index <= target_end_time]
+            target_pd = pd.Timestamp(target_end_time)  # ← fix: convert to pandas Timestamp
+            df = df[df.index <= target_pd]
             if df.empty:
-                st.warning(f"No 15m candles before or at {target_end_time} — check date/time or increase outputsize")
+                st.warning(f"No 15m candles ≤ {target_end_time} — try a later time or larger outputsize")
         return df
     except Exception as e:
         st.warning(f"15m fetch failed: {str(e)}")
@@ -63,7 +64,8 @@ def fetch_1h(target_end_time=None, outputsize=100):
         ts = ts.with_ema(time_period=200)
         df = ts.as_pandas()
         if target_end_time:
-            df = df[df.index <= target_end_time]
+            target_pd = pd.Timestamp(target_end_time)  # ← fix
+            df = df[df.index <= target_pd]
         return df
     except Exception as e:
         st.warning(f"1h fetch failed: {str(e)}")
@@ -134,13 +136,16 @@ def run_check(historical_end_time=None):
             ts_15m = fetch_15m(target_end_time=historical_end_time)
             ts_1h  = fetch_1h(target_end_time=historical_end_time)
             if ts_15m is None or ts_15m.empty:
-                st.error("No historical 15m data available up to selected time")
+                st.error("No historical 15m data available up to selected time — check date/time")
                 return
             price = ts_15m['close'].iloc[-1]
             current_time_str = historical_end_time.strftime('%Y-%m-%d %H:%M UTC')
             st.info(f"Historical test mode: simulating market at {current_time_str}")
             st.write(f"Simulated current price: ${price:.2f}")
-            st.write("Last 5 candles used (up to selected time):", ts_15m.tail(5)[['close', 'rsi', 'ema_50', 'ema_200', 'atr']])
+            if len(ts_15m) > 0:
+                st.write("Last 5 candles used:", ts_15m.tail(5)[['close', 'rsi', 'ema_50', 'ema_200', 'atr']])
+            else:
+                st.warning("No candles after slicing — data may be empty")
         else:
             price = get_live_price()
             ts_15m = fetch_15m()
@@ -237,7 +242,7 @@ Respond **ONLY** with valid JSON:
     k_p = parse_ai_output(k_raw)
     c_p = parse_ai_output(c_raw)
 
-    # Strict lot calculation (Python overrides any AI suggestion)
+    # Strict lot calculation
     best_entry = best_sl = None
     for p in [g_p, k_p, c_p]:
         e = p.get("entry_price") or p.get("entry")
