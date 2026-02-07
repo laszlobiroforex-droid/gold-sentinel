@@ -55,11 +55,10 @@ def fetch_recent_15m(outputsize=800):
         ts = ts.with_ema(time_period=200)
         ts = ts.with_macd(fast_period=12, slow_period=26, signal_period=9)
         ts = ts.with_adx(time_period=14)
-        ts = ts.with_bbands(time_period=20, std_dev_up=2, std_dev_down=2)
+        ts = ts.with_bbands(time_period=20, sd=2)
         ts = ts.with_atr(time_period=14)
         df = ts.as_pandas()
         df = df.rename(columns={
-            'ema_21': 'ema_21', 'ema_50': 'ema_50', 'ema_200': 'ema_200',
             'macd_macd': 'macd', 'macd_signal': 'macd_signal', 'macd_hist': 'macd_hist',
             'bbands_upper': 'bb_upper', 'bbands_middle': 'bb_middle', 'bbands_lower': 'bb_lower'
         })
@@ -78,11 +77,10 @@ def fetch_recent_1h(outputsize=200):
         ts = ts.with_ema(time_period=200)
         ts = ts.with_macd(fast_period=12, slow_period=26, signal_period=9)
         ts = ts.with_adx(time_period=14)
-        ts = ts.with_bbands(time_period=20, std_dev_up=2, std_dev_down=2)
+        ts = ts.with_bbands(time_period=20, sd=2)
         ts = ts.with_atr(time_period=14)
         df = ts.as_pandas()
         df = df.rename(columns={
-            'ema_21': 'ema_21', 'ema_50': 'ema_50', 'ema_200': 'ema_200',
             'macd_macd': 'macd', 'macd_signal': 'macd_signal', 'macd_hist': 'macd_hist',
             'bbands_upper': 'bb_upper', 'bbands_middle': 'bb_middle', 'bbands_lower': 'bb_lower'
         })
@@ -101,7 +99,7 @@ def fetch_longterm_4h_1d():
         ts_4h = ts_4h.with_ema(time_period=200)
         ts_4h = ts_4h.with_macd(fast_period=12, slow_period=26, signal_period=9)
         ts_4h = ts_4h.with_adx(time_period=14)
-        ts_4h = ts_4h.with_bbands(time_period=20, std_dev_up=2, std_dev_down=2)
+        ts_4h = ts_4h.with_bbands(time_period=20, sd=2)
         ts_4h = ts_4h.with_atr(time_period=14)
 
         ts_1d = td.time_series(symbol="XAU/USD", interval="1day", outputsize=60, timezone="UTC")
@@ -111,7 +109,7 @@ def fetch_longterm_4h_1d():
         ts_1d = ts_1d.with_ema(time_period=200)
         ts_1d = ts_1d.with_macd(fast_period=12, slow_period=26, signal_period=9)
         ts_1d = ts_1d.with_adx(time_period=14)
-        ts_1d = ts_1d.with_bbands(time_period=20, std_dev_up=2, std_dev_down=2)
+        ts_1d = ts_1d.with_bbands(time_period=20, sd=2)
         ts_1d = ts_1d.with_atr(time_period=14)
 
         df_4h = ts_4h.as_pandas()
@@ -161,13 +159,12 @@ def run_check(historical_end_time=None, test_dd_limit=None, test_risk_pct=None):
         if is_historical:
             st.info(f"Historical test mode: simulating market at {current_time_str}")
             st.write(f"Simulated current price: ${price:.2f}")
-            debug_cols = ['close', 'rsi', 'ema_21', 'ema_50', 'ema_200', 'atr', 'adx']
+            debug_cols = ['close', 'rsi', 'ema_21', 'ema_50', 'ema_200', 'atr', 'adx', 'macd', 'bb_upper']
             available_cols = [col for col in debug_cols if col in ts_15m.columns]
             st.write(f"Recent 15m candles: {len(ts_15m)}")
             st.write("Last timestamp:", ts_15m.index[-1])
             st.write("Last 5 recent candles:", ts_15m.tail(5)[available_cols])
 
-    # Long-term history
     long_term_df = load_long_term_history()
     long_term_summary = ""
     if long_term_df is not None and not long_term_df.empty:
@@ -187,6 +184,7 @@ Long-term context (4H/1D last 60 days):
     atr = latest_15m.get('atr', 10.0)
     ema200_15m = latest_15m.get('ema_200', price)
     ema50_15m  = latest_15m.get('ema_50', price)
+    ema21_15m  = latest_15m.get('ema_21', 'N/A')
 
     ema200_1h = ts_1h.iloc[-1].get('ema_200', price) if ts_1h is not None and not ts_1h.empty else price
 
@@ -218,7 +216,7 @@ Recent market data (15m):
 Price: ${price:.2f}
 RSI (15m): {rsi:.1f}
 ATR (15m): {atr:.2f}
-EMA21 / EMA50 / EMA200 (15m): {latest_15m.get('ema_21', 'N/A'):.2f} / {ema50_15m:.2f} / {ema200_15m:.2f}
+EMA21 / EMA50 / EMA200 (15m): {ema21_15m if isinstance(ema21_15m, (int,float)) else ema21_15m} / {ema50_15m:.2f} / {ema200_15m:.2f}
 EMA200 (1h): {ema200_1h:.2f}
 
 Recent support/resistance fractals: {', '.join([f"{t}@{p}" for t,p in levels[-8:]]) or 'None'}
