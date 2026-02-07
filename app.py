@@ -311,26 +311,40 @@ Important: Use the 1D/4H context and recent data to suggest realistic zones base
 
     if verdict in ["ELITE", "HIGH_CONVICTION"] and consensus_bias != "NEUTRAL" and len(entry_zones) >= 2 and len(stop_zones) >= 2:
         try:
-            entry_mins = [float(z.split('–')[0].strip()) for z in entry_zones if '–' in z]
-            entry_maxs = [float(z.split('–')[1].strip()) for z in entry_zones if '–' in z]
-            stop_mins = [float(z.split('–')[0].strip()) for z in stop_zones if '–' in z]
-            stop_maxs = [float(z.split('–')[1].strip()) for z in stop_zones if '–' in z]
+            entry_lows = []
+            entry_highs = []
+            stop_lows = []
+            stop_highs = []
+            for z in entry_zones:
+                if '–' in z:
+                    parts = z.split('–')
+                    low = float(parts[0].strip())
+                    high = float(parts[1].strip())
+                    entry_lows.append(low)
+                    entry_highs.append(high)
+            for z in stop_zones:
+                if '–' in z or 'below' in z or 'above' in z:
+                    z_clean = z.replace('below', '').replace('above', '').strip()
+                    if '–' in z_clean:
+                        parts = z_clean.split('–')
+                        low = float(parts[0].strip())
+                        high = float(parts[1].strip())
+                        stop_lows.append(low)
+                        stop_highs.append(high)
 
-            consensus_entry_low = min(entry_mins) if entry_mins else None
-            consensus_entry_high = max(entry_maxs) if entry_maxs else None
-            consensus_stop_low = min(stop_mins) if stop_mins else None
-            consensus_stop_high = max(stop_maxs) if stop_maxs else None
+            if entry_lows and entry_highs and stop_lows:
+                consensus_entry_low = min(entry_lows)
+                consensus_entry_high = max(entry_highs)
+                consensus_stop = min(stop_lows) if consensus_bias == "BULLISH" else max(stop_highs)
 
-            if consensus_entry_low and consensus_entry_high and consensus_stop_low and consensus_stop_high:
                 avg_entry = (consensus_entry_low + consensus_entry_high) / 2
-                worst_sl = consensus_stop_low if consensus_bias == "BULLISH" else consensus_stop_high
-                theoretical_risk = abs(avg_entry - worst_sl) * 100
+                theoretical_risk = abs(avg_entry - consensus_stop) * 100
 
                 if theoretical_risk > max_risk_dollars:
                     risk_warning = f"**RISK WARNING**: Consensus stop zone implies \~${theoretical_risk:.2f} risk — exceeds your ${max_risk_dollars:.2f} limit. Review or skip."
                 else:
-                    lot_size, lot_note = calculate_strict_lot_size(avg_entry, worst_sl, max_risk_dollars, price)
-                    telegram_zones = f"Consensus entry zone: {consensus_entry_low:.0f}–{consensus_entry_high:.0f}\nTightest stop zone: {'below' if consensus_bias == 'BULLISH' else 'above'} {worst_sl:.0f}"
+                    lot_size, lot_note = calculate_strict_lot_size(avg_entry, consensus_stop, max_risk_dollars, price)
+                    telegram_zones = f"Consensus entry zone: {consensus_entry_low:.0f}–{consensus_entry_high:.0f}\nTightest stop zone: {'below' if consensus_bias == 'BULLISH' else 'above'} {consensus_stop:.0f}"
         except:
             lot_note = "Zone parsing failed — min lot used"
 
@@ -364,9 +378,9 @@ with st.expander("Risk Settings", expanded=True):
 
     col1, col2 = st.columns(2)
     with col1:
-        dd_limit = st.number_input("Daily Drawdown Limit ($)", min_value=0.0, value=default_dd, format="%.2f")
+        dd_limit = st.number_input("Daily Drawdown Limit ($)", min_value=0.0, value=float(default_dd), format="%.2f", step=1.0)
     with col2:
-        risk_pct = st.number_input("Risk % of DD", min_value=1, max_value=100, value=default_pct, format="%d")
+        risk_pct = st.number_input("Risk % of DD", min_value=1, max_value=100, value=int(default_pct), format="%d", step=1)
 
     if st.button("Save Settings"):
         st.session_state.dd_limit = dd_limit
