@@ -132,7 +132,7 @@ def calculate_strict_lot_size(entry, sl, max_risk_dollars, current_price=None):
         return 0.01, "Calc error — min lot used"
 
 # ─── MAIN ANALYSIS FUNCTION ────────────────────────────────────────────────
-def run_check(historical_end_time=None):
+def run_check(historical_end_time=None, test_dd_limit=None, test_risk_pct=None):
     is_historical = historical_end_time is not None
 
     with st.spinner("Fetching data..."):
@@ -153,7 +153,7 @@ def run_check(historical_end_time=None):
                         debug_cols.append(col)
                 st.write(f"Number of candles available up to cutoff: {len(ts_15m)}")
                 st.write("First timestamp:", ts_15m.index[0])
-                st.write("Last timestamp:", ts_15m.index[-1])
+                st.write("Last timestamp (newest ≤ cutoff):", ts_15m.index[-1])
                 st.write("Last 5 candles (newest):", ts_15m.tail(5)[debug_cols])
         else:
             price = get_live_price()
@@ -179,11 +179,21 @@ def run_check(historical_end_time=None):
         if ts_15m['low'].iloc[i] == ts_15m['low'].iloc[i-5:i+5].min():
             levels.append(('SUP', round(ts_15m['low'].iloc[i], 2)))
 
-    balance        = st.session_state.get("balance")
-    dd_limit       = st.session_state.get("dd_limit")
-    risk_of_dd_pct = st.session_state.get("risk_of_dd_pct", 25.0)
+    # Use test values if in historical mode, otherwise session state
+    if is_historical:
+        dd_limit = test_dd_limit
+        risk_of_dd_pct = test_risk_pct
+    else:
+        dd_limit = st.session_state.get("dd_limit")
+        risk_of_dd_pct = st.session_state.get("risk_of_dd_pct", 25.0)
 
     max_risk_dollars = (dd_limit * risk_of_dd_pct / 100.0) if dd_limit else 50.0
+
+    # Show test parameters in historical mode
+    if is_historical:
+        st.write(f"Test DD limit: ${dd_limit:.2f}")
+        st.write(f"Test risk %: {risk_of_dd_pct}%")
+        st.write(f"Calculated max risk $: ${max_risk_dollars:.2f}")
 
     prompt = f"""
 Current UTC: {current_time_str}
@@ -259,7 +269,7 @@ Respond **ONLY** with valid JSON:
     k_p = parse_ai_output(k_raw)
     c_p = parse_ai_output(c_raw)
 
-    # Strict lot calculation
+    # Strict lot calculation (using the test or live values)
     best_entry = best_sl = None
     for p in [g_p, k_p, c_p]:
         e = p.get("entry_price") or p.get("entry")
@@ -401,7 +411,7 @@ Respond **ONLY** with valid JSON:
         else:
             st.info("Direction mismatch — no alert")
     else:
-        st.info("No strong consensus (or low-prob verdicts filtered) — no alert")
+        st.info("No strong consensus — no alert")
 
 # ─── UI ─────────────────────────────────────────────────────────────────────
 st.set_page_config(page_title="Gold Sentinel", page_icon="🥇", layout="wide")
@@ -438,13 +448,16 @@ with st.expander("Historical Test Mode (optional backtesting)", expanded=False):
     with col2:
         test_time = st.time_input("Test Time (UTC)", value=datetime.strptime("14:30", "%H:%M").time())
 
+    test_dd_limit = st.number_input("Daily Drawdown Limit ($) for this test", min_value=0.0, step=1.0, value=st.session_state.get("dd_limit", 251.45), format="%.2f")
+    test_risk_pct = st.number_input("Risk % of Daily DD for this test", min_value=1.0, max_value=100.0, value=st.session_state.get("risk_of_dd_pct", 25.0), step=1.0, format="%.0f")
+
     test_datetime = datetime.combine(test_date, test_time, tzinfo=timezone.utc)
 
     if st.button("Run Historical Test"):
         if test_datetime >= datetime.now(timezone.utc):
             st.error("Cannot test future or current time — pick a past moment.")
         else:
-            run_check(historical_end_time=test_datetime)
+            run_check(historical_end_time=test_datetime, test_dd_limit=test_dd_limit, test_risk_pct=test_risk_pct)
 
 # ─── AUTO / MANUAL CONTROLS ────────────────────────────────────────────────
 if "last_check_time" not in st.session_state:
