@@ -124,13 +124,53 @@ def load_long_term_4h():
             st.error(f"Failed to load 4H CSV: {str(e)}")
     return None
 
+# ─── ROBUST AI OUTPUT PARSER ───────────────────────────────────────────────
+def parse_ai_output(text):
+    if not text or not isinstance(text, str):
+        return {"verdict": "ERROR", "reason": "No output from AI"}
+
+    text = text.strip().strip('```json').strip('```').strip()
+
+    start = text.find('{')
+    end = text.rfind('}') + 1
+    if start == -1 or end == 0:
+        return {"verdict": "PARSE_ERROR", "reason": "No JSON block found"}
+
+    json_str = text[start:end]
+
+    try:
+        data = json.loads(json_str)
+        return {
+            "verdict": data.get("verdict", "UNKNOWN").upper(),
+            "reason": data.get("reason", "No reason"),
+            "entry_type": data.get("entry_type"),
+            "entry_price": data.get("entry_price"),
+            "sl": data.get("sl"),
+            "tp": data.get("tp"),
+            "rr": data.get("rr"),
+            "estimated_win_prob": data.get("estimated_win_prob"),
+            "style": data.get("style", "NONE").upper(),
+            "direction": data.get("direction", "NEUTRAL").upper(),
+            "reasoning": data.get("reasoning", "")
+        }
+    except json.JSONDecodeError as e:
+        return {
+            "verdict": "PARSE_ERROR",
+            "reason": f"Invalid JSON: {str(e)}. Raw: {text[:200]}..."
+        }
+    except Exception as e:
+        return {
+            "verdict": "PARSE_ERROR",
+            "reason": f"Unexpected error: {str(e)}"
+        }
+
 # ─── MAIN ANALYSIS FUNCTION ────────────────────────────────────────────────
 def run_check(historical_end_time=None, test_dd_limit=None, test_risk_pct=None):
     is_historical = historical_end_time is not None
 
     with st.spinner("Fetching recent data..."):
         ts_15m = fetch_recent_15m()
-        time.sleep(2)  # small delay to help with rate limit
+        time.sleep(2)  # Delay to help rate limit
         ts_1h  = fetch_recent_1h()
         if ts_15m is None or ts_15m.empty:
             st.error("No recent 15m data available")
@@ -147,7 +187,6 @@ def run_check(historical_end_time=None, test_dd_limit=None, test_risk_pct=None):
             st.write("Last timestamp:", ts_15m.index[-1])
             st.write("Last 5 recent candles:", ts_15m.tail(5)[available_cols])
 
-    # Load long-term files
     df_1d = load_long_term_1d()
     df_4h = load_long_term_4h()
 
@@ -159,7 +198,7 @@ def run_check(historical_end_time=None, test_dd_limit=None, test_risk_pct=None):
             lt_trend = "bullish" if lt_price > ema200_1d.iloc[-1] else "bearish"
             long_term_summary += f"\nDaily trend: {lt_trend} (price vs EMA200 1D)"
         else:
-            long_term_summary += "\nDaily EMA200 column not found"
+            long_term_summary += "\nDaily EMA200 column not found in CSV"
 
     if df_4h is not None and not df_4h.empty:
         lt_price_4h = df_4h['close'].iloc[-1]
@@ -237,13 +276,13 @@ Respond **ONLY** with valid JSON:
 """
 
     with st.spinner("Consulting AIs..."):
-        g_raw = k_raw = c_raw = '{"verdict":"ERROR","reason":"AI offline"}'
-
+        g_raw = '{"verdict":"ERROR","reason":"Gemini offline"}'
         try:
             g_raw = gemini_model.generate_content(prompt, generation_config={"temperature": 0.2}).text.strip()
         except Exception as e:
             st.warning(f"Gemini failed: {str(e)}")
 
+        k_raw = '{"verdict":"ERROR","reason":"Grok offline"}'
         try:
             r = grok_client.chat.completions.create(
                 model="grok-4",
@@ -255,6 +294,7 @@ Respond **ONLY** with valid JSON:
         except Exception as e:
             st.warning(f"Grok failed: {str(e)}")
 
+        c_raw = '{"verdict":"ERROR","reason":"ChatGPT offline"}'
         try:
             resp = openai_client.chat.completions.create(
                 model="gpt-4o-mini",
@@ -468,7 +508,6 @@ with st.expander("Historical Test Mode (optional backtesting)", expanded=False):
                       test_dd_limit=test_dd_limit, 
                       test_risk_pct=test_risk_pct)
 
-    # Long-term history split downloads
     st.markdown("**Download long-term history in two parts (combine later if needed)**")
     col_a, col_b = st.columns(2)
 
@@ -484,7 +523,6 @@ with st.expander("Historical Test Mode (optional backtesting)", expanded=False):
             if df_1d is not None:
                 st.download_button("Download 1D CSV", df_1d.to_csv(), "longterm_history_1D.csv", "text/csv")
 
-    # Recent snapshot download
     if 'last_ts_15m' in st.session_state and st.session_state['last_ts_15m'] is not None:
         df = st.session_state['last_ts_15m']
         csv_buffer = io.StringIO()
