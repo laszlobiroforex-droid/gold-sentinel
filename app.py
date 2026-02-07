@@ -46,9 +46,8 @@ def fetch_15m(end_time=None, outputsize=120):
     try:
         params = {"symbol": "XAU/USD", "interval": "15min", "outputsize": outputsize}
         if end_time:
-            # Buffer end_time to include last closed candle
             params["end"] = (end_time + timedelta(minutes=15)).isoformat()
-            params["start"] = (end_time - timedelta(hours=6)).isoformat()  # enough for indicators
+            params["start"] = (end_time - timedelta(hours=6)).isoformat()
         ts = td.time_series(**params)
         ts = ts.with_rsi().with_ema(time_period=200).with_ema(time_period=50).with_atr(time_period=14)
         return ts.as_pandas()
@@ -138,7 +137,8 @@ def run_check(historical_end_time=None):
             price = ts_15m['close'].iloc[-1]
             current_time_str = historical_end_time.strftime('%Y-%m-%d %H:%M UTC')
             st.info(f"Historical mode: simulating {current_time_str} | Last price used: ${price:.2f}")
-            st.write("Last 3 candles:", ts_15m.tail(3)[['close', 'rsi', 'ema_50', 'ema_200', 'atr']])
+            if len(ts_15m) > 0:
+                st.write("Last 3 candles:", ts_15m.tail(3)[['close', 'rsi', 'ema_50', 'ema_200', 'atr']])
         else:
             price = get_live_price()
             ts_15m = fetch_15m()
@@ -148,7 +148,6 @@ def run_check(historical_end_time=None):
                 return
             current_time_str = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
 
-    # ─── INDICATORS & LEVELS ───────────────────────────────────────────────────
     latest_15m = ts_15m.iloc[-1]
     rsi = latest_15m.get('rsi', 50.0)
     atr = latest_15m.get('atr', 10.0)
@@ -236,7 +235,7 @@ Respond **ONLY** with valid JSON:
     k_p = parse_ai_output(k_raw)
     c_p = parse_ai_output(c_raw)
 
-    # Strict lot calculation (Python overrides AI)
+    # Strict lot calculation
     best_entry = best_sl = None
     for p in [g_p, k_p, c_p]:
         e = p.get("entry_price") or p.get("entry")
@@ -251,15 +250,93 @@ Respond **ONLY** with valid JSON:
     if best_entry and best_sl:
         lot_size, lot_note = calculate_strict_lot_size(best_entry, best_sl, max_risk_dollars, price)
 
-    # ─── DISPLAY VERDICTS (use previous robust format_verdict) ──────────────
-    # ... paste your existing format_verdict function here (the one with isinstance checks)
+    # ─── DISPLAY VERDICTS ──────────────────────────────────────────────────────
+    st.divider()
+    st.subheader("AI Verdicts")
+
+    def format_verdict(p, ai_name, lot=None, note=""):
+        if p["verdict"] == "PARSE_ERROR":
+            return f"**{ai_name}** — Parse error: {p['reason']}"
+
+        verdict = p["verdict"]
+        colors = {
+            "ELITE": "#2ecc71", "HIGH_CONV": "#3498db",
+            "MODERATE": "#f1c40f", "LOW_EDGE": "#e67e22",
+            "NO_EDGE": "#95a5a6", "PARSE_ERROR": "#7f8c8d"
+        }
+        color = colors.get(verdict, "#7f8c8d")
+
+        entry_type = p.get('entry_type', '—')
+        entry_price_val = p.get('entry_price')
+        if isinstance(entry_price_val, (int, float)):
+            entry_price_str = f"${entry_price_val:.2f}"
+        else:
+            entry_price_str = "—"
+        entry_str = f"{entry_type} @ {entry_price_str}"
+
+        sl_val = p.get('sl')
+        sl_str = f"${sl_val:.2f}" if isinstance(sl_val, (int, float)) else "—"
+
+        tp_val = p.get('tp')
+        tp_str = f"${tp_val:.2f}" if isinstance(tp_val, (int, float)) else "—"
+
+        rr_val = p.get('rr')
+        rr_str = f"1:{rr_val:.1f}" if isinstance(rr_val, (int, float)) else "—"
+
+        prob_val = p.get('estimated_win_prob')
+        prob_str = f"{prob_val}%" if isinstance(prob_val, (int, float)) else "—"
+
+        risk_dollars_val = p.get('risk_dollars')
+        risk_pct_val     = p.get('risk_pct_of_dd')
+        exceed_flag      = p.get('exceeds_preferred_risk', False)
+
+        if isinstance(risk_dollars_val, (int, float)):
+            dollars_part = f"${risk_dollars_val:.2f}"
+        else:
+            dollars_part = "—"
+
+        if isinstance(risk_pct_val, (int, float)):
+            pct_part = f"{risk_pct_val:.1f}%"
+        else:
+            pct_part = "—"
+
+        risk_str = f"{dollars_part} ({pct_part} of DD)"
+        exceed_warning = '<span style="color:#e74c3c; font-weight:bold;">EXCEEDS preferred risk!</span>' if exceed_flag else ""
+
+        if isinstance(entry_price_val, (int, float)) and price and abs(entry_price_val - price) / price > 0.10:
+            entry_str += ' <span style="color:#e74c3c;">(unrealistic distance!)</span>'
+
+        lot_str = f"{lot:.2f}" if lot is not None else "—"
+
+        html = f"""
+        <div style="background:{color}11; border-left:5px solid {color}; padding:16px 20px; margin:16px 0; border-radius:8px; box-shadow:0 2px 8px rgba(0,0,0,0.1);">
+            <div style="font-size:1.3em; font-weight:bold; color:{color}; margin-bottom:8px;">
+                {ai_name} — {verdict}
+            </div>
+            <div style="margin-bottom:12px; color:#555;">{p['reason']}</div>
+            <div style="display:grid; grid-template-columns:1fr 1fr; gap:12px; margin:12px 0;">
+                <div><strong>Direction:</strong> {p['direction']}</div>
+                <div><strong>Style:</strong> {p['style']}</div>
+                <div><strong>Entry:</strong> {entry_str}</div>
+                <div><strong>SL:</strong> {sl_str}</div>
+                <div><strong>TP:</strong> {tp_str}</div>
+                <div><strong>RR:</strong> {rr_str}</div>
+                <div><strong>Est. Win Prob:</strong> {prob_str}</div>
+                <div><strong>Risk:</strong> {risk_str} {exceed_warning}</div>
+                <div><strong>Lot size:</strong> {lot_str}</div>
+            </div>
+            <div style="color:#555; font-size:0.9em; margin:8px 0;">{note or ''}</div>
+            <div style="font-style:italic; color:#444; margin-top:12px;">{p['reasoning']}</div>
+        </div>
+        """
+        return html
 
     col1, col2, col3 = st.columns(3)
     with col1: st.markdown(format_verdict(g_p, "Gemini",   lot_size, lot_note), unsafe_allow_html=True)
     with col2: st.markdown(format_verdict(k_p, "Grok",     lot_size, lot_note), unsafe_allow_html=True)
     with col3: st.markdown(format_verdict(c_p, "ChatGPT",  lot_size, lot_note), unsafe_allow_html=True)
 
-    # ─── CONSENSUS & TELEGRAM (conservative picking) ─────────────────────────
+    # Consensus logic (same as before)
     high_verdicts = [p for p in [g_p, k_p, c_p] if p["verdict"] in ["ELITE", "HIGH_CONV"]]
     if len(high_verdicts) >= 2:
         directions = [p["direction"] for p in high_verdicts if p["direction"] != "NEUTRAL"]
@@ -279,7 +356,7 @@ Respond **ONLY** with valid JSON:
 
             if len(valid_entries) >= 2:
                 entries_sorted = sorted(valid_entries, key=lambda x: x["entry"])
-                consensus_entry = entries_sorted[0]["entry"]  # lowest/safest
+                consensus_entry = entries_sorted[0]["entry"]
                 tps = [v["tp"] for v in valid_entries if isinstance(v["tp"], (int, float))]
                 consensus_tp = np.median(tps) if tps else "—"
                 sls = [v["sl"] for v in valid_entries if isinstance(v["sl"], (int, float))]
@@ -307,9 +384,25 @@ st.set_page_config(page_title="Gold Sentinel", page_icon="🥇", layout="wide")
 st.title("🥇 Gold Sentinel – AI-Driven Gold Setups")
 st.caption(f"Gemini • Grok • ChatGPT | {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
 
-# Risk settings expander (unchanged)
 with st.expander("Prop Challenge / Risk Settings (required for lot sizing)", expanded=True):
-    # ... your existing code for balance, dd_limit, risk_pct ...
+    default_balance = st.session_state.get("balance", 5029.00)
+    default_dd = st.session_state.get("dd_limit", 251.45)
+    default_risk_pct = st.session_state.get("risk_of_dd_pct", 25.0)
+
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        balance_input = st.number_input("Current Balance ($)", min_value=0.0, step=0.01, value=default_balance, format="%.2f")
+    with col2:
+        dd_input = st.number_input("Daily Drawdown Limit ($)", min_value=0.0, step=1.0, value=default_dd, format="%.2f")
+    with col3:
+        risk_input = st.number_input("Preferred risk % of Daily DD", min_value=1.0, max_value=100.0, value=default_risk_pct, step=1.0, format="%.0f")
+
+    if st.button("Save & Apply Settings", type="primary", use_container_width=True):
+        st.session_state.balance = balance_input
+        st.session_state.dd_limit = dd_input
+        st.session_state.risk_of_dd_pct = risk_input
+        st.success("Settings saved!")
+        st.rerun()
 
 # ─── HISTORICAL TEST MODE (optional) ───────────────────────────────────────
 with st.expander("Historical Test Mode (optional backtesting)", expanded=False):
@@ -340,7 +433,7 @@ if auto_enabled:
     time_since = now - st.session_state.last_check_time
     if time_since >= CHECK_INTERVAL_MIN * 60:
         st.session_state.last_check_time = now
-        run_check()  # live mode
+        run_check()
     else:
         remaining = int(CHECK_INTERVAL_MIN * 60 - time_since)
         st.caption(f"Next auto-run in {remaining // 60} min {remaining % 60} sec")
@@ -348,4 +441,4 @@ else:
     st.info("Auto mode off — use the button below")
 
 if st.button("📡 Run Analysis Now (Live)", type="primary", use_container_width=True):
-    run_check()  # live mode
+    run_check()
