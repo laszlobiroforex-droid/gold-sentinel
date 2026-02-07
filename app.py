@@ -13,7 +13,8 @@ import os
 
 # ─── CONFIG ────────────────────────────────────────────────────────────────
 CHECK_INTERVAL_MIN = 30
-LONG_TERM_CSV_PATH = "history_longterm.csv"
+CSV_1D_PATH = "longterm_history_1D.csv"
+CSV_4H_PATH = "longterm_history_4H.csv"
 
 # ─── API INIT ──────────────────────────────────────────────────────────────
 td = TDClient(apikey=st.secrets["TWELVE_DATA_KEY"])
@@ -50,18 +51,10 @@ def fetch_recent_15m(outputsize=800):
     try:
         ts = td.time_series(symbol="XAU/USD", interval="15min", outputsize=outputsize, timezone="UTC")
         ts = ts.with_rsi(time_period=14)
-        ts = ts.with_ema(time_period=21)
         ts = ts.with_ema(time_period=50)
         ts = ts.with_ema(time_period=200)
-        ts = ts.with_macd(fast_period=12, slow_period=26, signal_period=9)
-        ts = ts.with_adx(time_period=14)
-        ts = ts.with_bbands(time_period=20, sd=2)
         ts = ts.with_atr(time_period=14)
         df = ts.as_pandas()
-        df = df.rename(columns={
-            'macd_macd': 'macd', 'macd_signal': 'macd_signal', 'macd_hist': 'macd_hist',
-            'bbands_upper': 'bb_upper', 'bbands_middle': 'bb_middle', 'bbands_lower': 'bb_lower'
-        })
         df = df.sort_index(ascending=True)
         return df
     except Exception as e:
@@ -72,60 +65,64 @@ def fetch_recent_1h(outputsize=200):
     try:
         ts = td.time_series(symbol="XAU/USD", interval="1h", outputsize=outputsize, timezone="UTC")
         ts = ts.with_rsi(time_period=14)
-        ts = ts.with_ema(time_period=21)
         ts = ts.with_ema(time_period=50)
         ts = ts.with_ema(time_period=200)
-        ts = ts.with_macd(fast_period=12, slow_period=26, signal_period=9)
-        ts = ts.with_adx(time_period=14)
-        ts = ts.with_bbands(time_period=20, sd=2)
         ts = ts.with_atr(time_period=14)
         df = ts.as_pandas()
-        df = df.rename(columns={
-            'macd_macd': 'macd', 'macd_signal': 'macd_signal', 'macd_hist': 'macd_hist',
-            'bbands_upper': 'bb_upper', 'bbands_middle': 'bb_middle', 'bbands_lower': 'bb_lower'
-        })
         df = df.sort_index(ascending=True)
         return df
     except Exception as e:
         st.warning(f"Recent 1h fetch failed: {str(e)}")
         return None
 
-def fetch_longterm_4h_1d():
+# ─── LONG-TERM DOWNLOAD HELPERS ────────────────────────────────────────────
+def download_4h_data():
     try:
-        # 4H — minimal to fit credit limit
         ts_4h = td.time_series(symbol="XAU/USD", interval="4h", outputsize=360, timezone="UTC")
         ts_4h = ts_4h.with_ema(time_period=50)
         ts_4h = ts_4h.with_ema(time_period=200)
         ts_4h = ts_4h.with_rsi(time_period=14)
         ts_4h = ts_4h.with_atr(time_period=14)
+        df = ts_4h.as_pandas()
+        return df
+    except Exception as e:
+        st.error(f"4H download failed: {str(e)}")
+        return None
 
-        # 1D — minimal
+def download_1d_data():
+    try:
         ts_1d = td.time_series(symbol="XAU/USD", interval="1day", outputsize=60, timezone="UTC")
         ts_1d = ts_1d.with_ema(time_period=50)
         ts_1d = ts_1d.with_ema(time_period=200)
         ts_1d = ts_1d.with_rsi(time_period=14)
         ts_1d = ts_1d.with_atr(time_period=14)
-
-        df_4h = ts_4h.as_pandas()
-        df_1d = ts_1d.as_pandas()
-
-        combined = pd.concat([df_4h, df_1d]).sort_index(ascending=True)
-        return combined
+        df = ts_1d.as_pandas()
+        return df
     except Exception as e:
-        st.error(f"Long-term 4H/1D fetch failed: {str(e)}")
+        st.error(f"1D download failed: {str(e)}")
         return None
 
 # ─── LOAD LONG-TERM HISTORY ────────────────────────────────────────────────
 @st.cache_data
-def load_long_term_history():
-    if os.path.exists(LONG_TERM_CSV_PATH):
+def load_long_term_1d():
+    if os.path.exists(CSV_1D_PATH):
         try:
-            df = pd.read_csv(LONG_TERM_CSV_PATH, parse_dates=['datetime'], index_col='datetime')
+            df = pd.read_csv(CSV_1D_PATH, parse_dates=['datetime'], index_col='datetime')
             df.index = pd.to_datetime(df.index, utc=True).tz_convert(None)
-            st.success(f"Loaded long-term history ({len(df)} rows)")
             return df
         except Exception as e:
-            st.error(f"Failed to load long-term CSV: {str(e)}")
+            st.error(f"Failed to load 1D CSV: {str(e)}")
+    return None
+
+@st.cache_data
+def load_long_term_4h():
+    if os.path.exists(CSV_4H_PATH):
+        try:
+            df = pd.read_csv(CSV_4H_PATH, parse_dates=['datetime'], index_col='datetime')
+            df.index = pd.to_datetime(df.index, utc=True).tz_convert(None)
+            return df
+        except Exception as e:
+            st.error(f"Failed to load 4H CSV: {str(e)}")
     return None
 
 # ─── MAIN ANALYSIS FUNCTION ────────────────────────────────────────────────
@@ -150,15 +147,19 @@ def run_check(historical_end_time=None, test_dd_limit=None, test_risk_pct=None):
             st.write("Last timestamp:", ts_15m.index[-1])
             st.write("Last 5 recent candles:", ts_15m.tail(5)[available_cols])
 
-    long_term_df = load_long_term_history()
+    # Load long-term files
+    df_1d = load_long_term_1d()
+    df_4h = load_long_term_4h()
+
     long_term_summary = ""
-    if long_term_df is not None and not long_term_df.empty:
-        lt_price = long_term_df['close'].iloc[-1]
-        lt_trend = "bullish" if lt_price > long_term_df['ema_200'].iloc[-1] else "bearish"
-        long_term_summary = f"""
-Long-term context (4H/1D last 60 days):
-- Trend: {lt_trend} (price vs EMA200)
-"""
+    if df_1d is not None and not df_1d.empty:
+        lt_price = df_1d['close'].iloc[-1]
+        lt_trend = "bullish" if lt_price > df_1d['ema_200'].iloc[-1] else "bearish"
+        long_term_summary += f"\nDaily trend: {lt_trend} (price vs EMA200 1D)"
+
+    if df_4h is not None and not df_4h.empty:
+        lt_price_4h = df_4h['close'].iloc[-1]
+        long_term_summary += f"\n4H current price: {lt_price_4h:.2f}"
 
     latest_15m = ts_15m.iloc[-1]
     rsi = latest_15m.get('rsi', 50.0)
@@ -436,7 +437,7 @@ with st.expander("Prop Challenge / Risk Settings (required for lot sizing)", exp
 
 # ─── HISTORICAL TEST MODE ──────────────────────────────────────────────────
 with st.expander("Historical Test Mode (optional backtesting)", expanded=False):
-    st.info("Select a PAST date/time to simulate market state exactly then. Uses recent API data + optional long-term CSV context.")
+    st.info("Select a PAST date/time to simulate market state exactly then. Uses recent API data + optional long-term CSV files.")
     
     col1, col2 = st.columns(2)
     with col1:
@@ -463,24 +464,23 @@ with st.expander("Historical Test Mode (optional backtesting)", expanded=False):
                       test_dd_limit=test_dd_limit, 
                       test_risk_pct=test_risk_pct)
 
-    # Long-term history update button
-    if st.button("Download fresh 60-day 4H & 1D data for manual update"):
-        df_long = fetch_longterm_4h_1d()
-        if df_long is not None:
-            csv_buffer = io.StringIO()
-            df_long.to_csv(csv_buffer)
-            csv_data = csv_buffer.getvalue()
-            st.download_button(
-                label="Download long-term history CSV",
-                data=csv_data,
-                file_name="history_longterm_update.csv",
-                mime="text/csv",
-                help="Rename to history_longterm.csv and upload to app root"
-            )
-        else:
-            st.error("Failed to fetch long-term data — check API key, network, or rate limits")
+    # Long-term history split downloads
+    st.markdown("**Download long-term history in two parts (combine later if needed)**")
+    col_a, col_b = st.columns(2)
 
-    # Download recent snapshot
+    with col_a:
+        if st.button("Download 4H data (60 days)"):
+            df_4h = download_4h_data()
+            if df_4h is not None:
+                st.download_button("Download 4H CSV", df_4h.to_csv(), "longterm_history_4H.csv", "text/csv")
+
+    with col_b:
+        if st.button("Download 1D data (60 days)"):
+            df_1d = download_1d_data()
+            if df_1d is not None:
+                st.download_button("Download 1D CSV", df_1d.to_csv(), "longterm_history_1D.csv", "text/csv")
+
+    # Recent snapshot download
     if 'last_ts_15m' in st.session_state and st.session_state['last_ts_15m'] is not None:
         df = st.session_state['last_ts_15m']
         csv_buffer = io.StringIO()
