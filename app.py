@@ -11,12 +11,10 @@ import pandas as pd
 import io
 import os
 
-# ─── CONFIG ────────────────────────────────────────────────────────────────
 CHECK_INTERVAL_MIN = 30
 CSV_1D_PATH = "longterm_history_1D.csv"
 CSV_4H_PATH = "longterm_history_4H.csv"
 
-# ─── API INIT ──────────────────────────────────────────────────────────────
 td = TDClient(apikey=st.secrets["TWELVE_DATA_KEY"])
 genai.configure(api_key=st.secrets["GEMINI_KEY"])
 gemini_model = genai.GenerativeModel('gemini-2.5-flash')
@@ -24,7 +22,6 @@ gemini_model = genai.GenerativeModel('gemini-2.5-flash')
 grok_client   = OpenAI(api_key=st.secrets["GROK_API_KEY"], base_url="https://api.x.ai/v1")
 openai_client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
 
-# ─── TELEGRAM ──────────────────────────────────────────────────────────────
 def send_telegram(message, priority="normal"):
     token   = st.secrets.get("TELEGRAM_BOT_TOKEN")
     chat_id = st.secrets.get("TELEGRAM_CHAT_ID")
@@ -40,7 +37,6 @@ def send_telegram(message, priority="normal"):
     except Exception as e:
         st.error(f"Telegram send failed: {e}")
 
-# ─── DATA FETCH ────────────────────────────────────────────────────────────
 def get_live_price():
     try:
         return float(td.price(symbol="XAU/USD").as_json()["price"])
@@ -99,7 +95,6 @@ def download_1d_data():
         st.error(f"1D download failed: {str(e)}")
         return None
 
-# ─── LOAD LONG-TERM HISTORY ────────────────────────────────────────────────
 @st.cache_data
 def load_long_term_1d():
     if os.path.exists(CSV_1D_PATH):
@@ -124,7 +119,6 @@ def load_long_term_4h():
             st.error(f"Failed to load 4H CSV: {str(e)}")
     return None
 
-# ─── ROBUST AI OUTPUT PARSER ───────────────────────────────────────────────
 def parse_ai_output(text):
     if not text or not isinstance(text, str):
         return {"verdict": "ERROR", "reason": "No output from AI"}
@@ -164,13 +158,34 @@ def parse_ai_output(text):
             "reason": f"Unexpected error: {str(e)}"
         }
 
-# ─── MAIN ANALYSIS FUNCTION ────────────────────────────────────────────────
+def calculate_strict_lot_size(entry, sl, max_risk_dollars, current_price=None):
+    if not all(v is not None for v in [entry, sl, max_risk_dollars]):
+        return 0.01, "Missing data — min lot used"
+
+    try:
+        entry = float(entry)
+        sl = float(sl)
+        price_diff = abs(entry - sl)
+        if price_diff <= 0:
+            return 0.01, "Invalid SL — min lot used"
+
+        lot_size = max_risk_dollars / (price_diff * 100)
+        lot_size_rounded = max(round(lot_size, 2), 0.01)
+
+        actual_risk = lot_size_rounded * price_diff * 100
+        note = f"Adjusted to fit ${max_risk_dollars:.2f} max risk"
+        if actual_risk > max_risk_dollars * 1.05:
+            note += " — still slightly over (wide SL)"
+        return lot_size_rounded, note
+    except:
+        return 0.01, "Calc error — min lot used"
+
 def run_check(historical_end_time=None, test_dd_limit=None, test_risk_pct=None):
     is_historical = historical_end_time is not None
 
     with st.spinner("Fetching recent data..."):
         ts_15m = fetch_recent_15m()
-        time.sleep(2)  # Delay to help rate limit
+        time.sleep(2)
         ts_1h  = fetch_recent_1h()
         if ts_15m is None or ts_15m.empty:
             st.error("No recent 15m data available")
@@ -310,9 +325,13 @@ Respond **ONLY** with valid JSON:
     k_p = parse_ai_output(k_raw)
     c_p = parse_ai_output(c_raw)
 
-    # Strict lot calculation
+    lot_size = 0.01
+    lot_note = "Min lot (no valid entry/SL from AIs)"
+
     best_entry = best_sl = None
     for p in [g_p, k_p, c_p]:
+        if p.get("verdict") in ["PARSE_ERROR", "ERROR", "NO_EDGE"]:
+            continue
         e = p.get("entry_price") or p.get("entry")
         s = p.get("sl")
         if isinstance(e, (int, float)) and isinstance(s, (int, float)):
@@ -320,12 +339,14 @@ Respond **ONLY** with valid JSON:
             best_sl = s
             break
 
-    lot_size = 0.01
-    lot_note = "Min lot (no valid entry/SL)"
-    if best_entry and best_sl:
-        lot_size, lot_note = calculate_strict_lot_size(best_entry, best_sl, max_risk_dollars, price)
+    if best_entry is not None and best_sl is not None:
+        try:
+            lot_size, lot_note = calculate_strict_lot_size(best_entry, best_sl, max_risk_dollars, price)
+        except Exception as calc_err:
+            lot_note = f"Lot calc error: {str(calc_err)} — using min lot"
+    else:
+        lot_note = "No valid numeric entry/SL from any AI — using min lot"
 
-    # ─── DISPLAY VERDICTS ──────────────────────────────────────────────────────
     st.divider()
     st.subheader("AI Verdicts")
 
@@ -411,7 +432,6 @@ Respond **ONLY** with valid JSON:
     with col2: st.markdown(format_verdict(k_p, "Grok",     lot_size, lot_note), unsafe_allow_html=True)
     with col3: st.markdown(format_verdict(c_p, "ChatGPT",  lot_size, lot_note), unsafe_allow_html=True)
 
-    # ─── CONSENSUS & TELEGRAM ──────────────────────────────────────────────────
     high_verdicts = [p for p in [g_p, k_p, c_p] if p["verdict"] in ["ELITE", "HIGH_CONV"] and p.get("estimated_win_prob", 0) >= 60]
     if len(high_verdicts) >= 2:
         directions = [p["direction"] for p in high_verdicts if p["direction"] != "NEUTRAL"]
@@ -454,7 +474,6 @@ Respond **ONLY** with valid JSON:
     else:
         st.info("No strong consensus — no alert")
 
-# ─── UI ─────────────────────────────────────────────────────────────────────
 st.set_page_config(page_title="Gold Sentinel", page_icon="🥇", layout="wide")
 st.title("🥇 Gold Sentinel – AI-Driven Gold Setups")
 st.caption(f"Gemini • Grok • ChatGPT | {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
@@ -479,7 +498,6 @@ with st.expander("Prop Challenge / Risk Settings (required for lot sizing)", exp
         st.success("Settings saved!")
         st.rerun()
 
-# ─── HISTORICAL TEST MODE ──────────────────────────────────────────────────
 with st.expander("Historical Test Mode (optional backtesting)", expanded=False):
     st.info("Select a PAST date/time to simulate market state exactly then. Uses recent API data + optional long-term CSV files.")
     
@@ -541,7 +559,6 @@ with st.expander("Historical Test Mode (optional backtesting)", expanded=False):
     else:
         st.info("Run a test first to enable recent snapshot download.")
 
-# ─── AUTO / MANUAL CONTROLS ────────────────────────────────────────────────
 if "last_check_time" not in st.session_state:
     st.session_state.last_check_time = 0
 
