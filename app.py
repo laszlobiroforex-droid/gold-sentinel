@@ -52,6 +52,8 @@ def fetch_15m(target_end_time=None, outputsize=200):
             target_pd = pd.Timestamp(target_end_time).tz_localize(None)
             df.index = df.index.tz_localize(None) if df.index.tz is not None else df.index
             df = df[df.index <= target_pd]
+            # Fix: Sort ascending so tail() shows newest candles
+            df = df.sort_index(ascending=True)
             if df.empty:
                 st.warning(f"No 15m candles ≤ {target_end_time} — try later time or larger outputsize")
         return df
@@ -68,6 +70,7 @@ def fetch_1h(target_end_time=None, outputsize=100):
             target_pd = pd.Timestamp(target_end_time).tz_localize(None)
             df.index = df.index.tz_localize(None) if df.index.tz is not None else df.index
             df = df[df.index <= target_pd]
+            df = df.sort_index(ascending=True)  # Fix: ascending sort
         return df
     except Exception as e:
         st.warning(f"1h fetch failed: {str(e)}")
@@ -138,19 +141,22 @@ def run_check(historical_end_time=None):
             ts_15m = fetch_15m(target_end_time=historical_end_time)
             ts_1h  = fetch_1h(target_end_time=historical_end_time)
             if ts_15m is None or ts_15m.empty:
-                st.error("No historical 15m data available up to selected time — check date/time or increase outputsize")
+                st.error("No historical 15m data available up to selected time — check date/time")
                 return
             price = ts_15m['close'].iloc[-1]
             current_time_str = historical_end_time.strftime('%Y-%m-%d %H:%M UTC')
             st.info(f"Historical test mode: simulating market at {current_time_str}")
             st.write(f"Simulated current price: ${price:.2f}")
             if len(ts_15m) > 0:
-                # Safe column selection for debug
+                # Safe debug columns
                 debug_cols = ['close']
                 for col in ['rsi', 'ema_50', 'ema_200', 'atr']:
                     if col in ts_15m.columns:
                         debug_cols.append(col)
-                st.write("Last 5 candles used (available columns):", ts_15m.tail(5)[debug_cols])
+                st.write(f"Number of candles available up to cutoff: {len(ts_15m)}")
+                st.write("First timestamp:", ts_15m.index[0])
+                st.write("Last timestamp (should be ≤ cutoff):", ts_15m.index[-1])
+                st.write("Last 5 candles (newest):", ts_15m.tail(5)[debug_cols])
             else:
                 st.warning("No candles after slicing")
         else:
@@ -426,7 +432,7 @@ with st.expander("Historical Test Mode (optional backtesting)", expanded=False):
     with col1:
         test_date = st.date_input("Test Date", value=datetime.now(timezone.utc).date() - timedelta(days=1))
     with col2:
-        test_time = st.time_input("Test Time (UTC)", value=datetime.strptime("05:27", "%H:%M").time())
+        test_time = st.time_input("Test Time (UTC)", value=datetime.strptime("14:30", "%H:%M").time())
 
     test_datetime = datetime.combine(test_date, test_time, tzinfo=timezone.utc)
 
