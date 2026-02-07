@@ -50,7 +50,6 @@ def get_live_price():
 def fetch_recent_15m(outputsize=800):
     try:
         ts = td.time_series(symbol="XAU/USD", interval="15min", outputsize=outputsize, timezone="UTC")
-        ts = ts.with_rsi(time_period=14)
         ts = ts.with_ema(time_period=50)
         ts = ts.with_ema(time_period=200)
         ts = ts.with_atr(time_period=14)
@@ -64,7 +63,6 @@ def fetch_recent_15m(outputsize=800):
 def fetch_recent_1h(outputsize=200):
     try:
         ts = td.time_series(symbol="XAU/USD", interval="1h", outputsize=outputsize, timezone="UTC")
-        ts = ts.with_rsi(time_period=14)
         ts = ts.with_ema(time_period=50)
         ts = ts.with_ema(time_period=200)
         ts = ts.with_atr(time_period=14)
@@ -75,7 +73,6 @@ def fetch_recent_1h(outputsize=200):
         st.warning(f"Recent 1h fetch failed: {str(e)}")
         return None
 
-# ─── LONG-TERM DOWNLOAD HELPERS ────────────────────────────────────────────
 def download_4h_data():
     try:
         ts_4h = td.time_series(symbol="XAU/USD", interval="4h", outputsize=360, timezone="UTC")
@@ -109,6 +106,7 @@ def load_long_term_1d():
         try:
             df = pd.read_csv(CSV_1D_PATH, parse_dates=['datetime'], index_col='datetime')
             df.index = pd.to_datetime(df.index, utc=True).tz_convert(None)
+            st.success(f"Loaded 1D history ({len(df)} rows)")
             return df
         except Exception as e:
             st.error(f"Failed to load 1D CSV: {str(e)}")
@@ -120,6 +118,7 @@ def load_long_term_4h():
         try:
             df = pd.read_csv(CSV_4H_PATH, parse_dates=['datetime'], index_col='datetime')
             df.index = pd.to_datetime(df.index, utc=True).tz_convert(None)
+            st.success(f"Loaded 4H history ({len(df)} rows)")
             return df
         except Exception as e:
             st.error(f"Failed to load 4H CSV: {str(e)}")
@@ -131,6 +130,7 @@ def run_check(historical_end_time=None, test_dd_limit=None, test_risk_pct=None):
 
     with st.spinner("Fetching recent data..."):
         ts_15m = fetch_recent_15m()
+        time.sleep(2)  # small delay to help with rate limit
         ts_1h  = fetch_recent_1h()
         if ts_15m is None or ts_15m.empty:
             st.error("No recent 15m data available")
@@ -141,7 +141,7 @@ def run_check(historical_end_time=None, test_dd_limit=None, test_risk_pct=None):
         if is_historical:
             st.info(f"Historical test mode: simulating market at {current_time_str}")
             st.write(f"Simulated current price: ${price:.2f}")
-            debug_cols = ['close', 'rsi', 'ema_50', 'ema_200', 'atr']
+            debug_cols = ['close', 'ema_50', 'ema_200', 'atr']
             available_cols = [col for col in debug_cols if col in ts_15m.columns]
             st.write(f"Recent 15m candles: {len(ts_15m)}")
             st.write("Last timestamp:", ts_15m.index[-1])
@@ -153,9 +153,13 @@ def run_check(historical_end_time=None, test_dd_limit=None, test_risk_pct=None):
 
     long_term_summary = ""
     if df_1d is not None and not df_1d.empty:
-        lt_price = df_1d['close'].iloc[-1]
-        lt_trend = "bullish" if lt_price > df_1d['ema_200'].iloc[-1] else "bearish"
-        long_term_summary += f"\nDaily trend: {lt_trend} (price vs EMA200 1D)"
+        ema200_1d = df_1d.get('ema_200') or df_1d.get('ema (200)') or df_1d.get('ema')
+        if ema200_1d is not None:
+            lt_price = df_1d['close'].iloc[-1]
+            lt_trend = "bullish" if lt_price > ema200_1d.iloc[-1] else "bearish"
+            long_term_summary += f"\nDaily trend: {lt_trend} (price vs EMA200 1D)"
+        else:
+            long_term_summary += "\nDaily EMA200 column not found"
 
     if df_4h is not None and not df_4h.empty:
         lt_price_4h = df_4h['close'].iloc[-1]
