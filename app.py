@@ -26,7 +26,6 @@ def send_telegram(message, priority="normal"):
     token   = st.secrets.get("TELEGRAM_BOT_TOKEN")
     chat_id = st.secrets.get("TELEGRAM_CHAT_ID")
     if not token or not chat_id:
-        st.warning("Telegram not configured")
         return
 
     emoji = "🟢 ELITE" if priority == "high" else "🔵 Conviction"
@@ -34,8 +33,8 @@ def send_telegram(message, priority="normal"):
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     try:
         requests.post(url, json={"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}, timeout=8)
-    except Exception as e:
-        st.error(f"Telegram send failed: {e}")
+    except:
+        pass
 
 def get_live_price():
     try:
@@ -53,7 +52,7 @@ def fetch_recent_15m(outputsize=800):
         df = df.sort_index(ascending=True)
         return df
     except Exception as e:
-        st.warning(f"Recent 15m fetch failed: {str(e)}")
+        st.warning(f"15m data fetch failed: {str(e)}")
         return None
 
 def fetch_recent_1h(outputsize=200):
@@ -66,31 +65,29 @@ def fetch_recent_1h(outputsize=200):
         df = df.sort_index(ascending=True)
         return df
     except Exception as e:
-        st.warning(f"Recent 1h fetch failed: {str(e)}")
+        st.warning(f"1h data fetch failed: {str(e)}")
         return None
 
 def download_4h_data():
     try:
-        ts_4h = td.time_series(symbol="XAU/USD", interval="4h", outputsize=360, timezone="UTC")
-        ts_4h = ts_4h.with_ema(time_period=50)
-        ts_4h = ts_4h.with_ema(time_period=200)
-        ts_4h = ts_4h.with_rsi(time_period=14)
-        ts_4h = ts_4h.with_atr(time_period=14)
-        df = ts_4h.as_pandas()
-        return df
+        ts = td.time_series(symbol="XAU/USD", interval="4h", outputsize=360, timezone="UTC")
+        ts = ts.with_ema(time_period=50)
+        ts = ts.with_ema(time_period=200)
+        ts = ts.with_rsi(time_period=14)
+        ts = ts.with_atr(time_period=14)
+        return ts.as_pandas()
     except Exception as e:
         st.error(f"4H download failed: {str(e)}")
         return None
 
 def download_1d_data():
     try:
-        ts_1d = td.time_series(symbol="XAU/USD", interval="1day", outputsize=60, timezone="UTC")
-        ts_1d = ts_1d.with_ema(time_period=50)
-        ts_1d = ts_1d.with_ema(time_period=200)
-        ts_1d = ts_1d.with_rsi(time_period=14)
-        ts_1d = ts_1d.with_atr(time_period=14)
-        df = ts_1d.as_pandas()
-        return df
+        ts = td.time_series(symbol="XAU/USD", interval="1day", outputsize=60, timezone="UTC")
+        ts = ts.with_ema(time_period=50)
+        ts = ts.with_ema(time_period=200)
+        ts = ts.with_rsi(time_period=14)
+        ts = ts.with_atr(time_period=14)
+        return ts.as_pandas()
     except Exception as e:
         st.error(f"1D download failed: {str(e)}")
         return None
@@ -101,10 +98,9 @@ def load_long_term_1d():
         try:
             df = pd.read_csv(CSV_1D_PATH, parse_dates=['datetime'], index_col='datetime')
             df.index = pd.to_datetime(df.index, utc=True).tz_convert(None)
-            st.success(f"Loaded 1D history ({len(df)} rows)")
             return df
-        except Exception as e:
-            st.error(f"Failed to load 1D CSV: {str(e)}")
+        except:
+            return None
     return None
 
 @st.cache_data
@@ -113,50 +109,10 @@ def load_long_term_4h():
         try:
             df = pd.read_csv(CSV_4H_PATH, parse_dates=['datetime'], index_col='datetime')
             df.index = pd.to_datetime(df.index, utc=True).tz_convert(None)
-            st.success(f"Loaded 4H history ({len(df)} rows)")
             return df
-        except Exception as e:
-            st.error(f"Failed to load 4H CSV: {str(e)}")
+        except:
+            return None
     return None
-
-def parse_ai_output(text):
-    if not text or not isinstance(text, str):
-        return {"verdict": "ERROR", "reason": "No output from AI"}
-
-    text = text.strip().strip('```json').strip('```').strip()
-
-    start = text.find('{')
-    end = text.rfind('}') + 1
-    if start == -1 or end == 0:
-        return {"verdict": "PARSE_ERROR", "reason": "No JSON block found"}
-
-    json_str = text[start:end]
-
-    try:
-        data = json.loads(json_str)
-        return {
-            "verdict": data.get("verdict", "UNKNOWN").upper(),
-            "reason": data.get("reason", "No reason"),
-            "entry_type": data.get("entry_type"),
-            "entry_price": data.get("entry_price"),
-            "sl": data.get("sl"),
-            "tp": data.get("tp"),
-            "rr": data.get("rr"),
-            "estimated_win_prob": data.get("estimated_win_prob"),
-            "style": data.get("style", "NONE").upper(),
-            "direction": data.get("direction", "NEUTRAL").upper(),
-            "reasoning": data.get("reasoning", "")
-        }
-    except json.JSONDecodeError as e:
-        return {
-            "verdict": "PARSE_ERROR",
-            "reason": f"Invalid JSON: {str(e)}. Raw: {text[:200]}..."
-        }
-    except Exception as e:
-        return {
-            "verdict": "PARSE_ERROR",
-            "reason": f"Unexpected error: {str(e)}"
-        }
 
 def calculate_strict_lot_size(entry, sl, max_risk_dollars, current_price=None):
     if not all(v is not None for v in [entry, sl, max_risk_dollars]):
@@ -180,9 +136,7 @@ def calculate_strict_lot_size(entry, sl, max_risk_dollars, current_price=None):
     except:
         return 0.01, "Calc error — min lot used"
 
-def run_check(historical_end_time=None, test_dd_limit=None, test_risk_pct=None):
-    is_historical = historical_end_time is not None
-
+def run_check():
     with st.spinner("Fetching recent data..."):
         ts_15m = fetch_recent_15m()
         time.sleep(2)
@@ -191,16 +145,7 @@ def run_check(historical_end_time=None, test_dd_limit=None, test_risk_pct=None):
             st.error("No recent 15m data available")
             return
         price = ts_15m['close'].iloc[-1]
-        current_time_str = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC') if not is_historical else historical_end_time.strftime('%Y-%m-%d %H:%M UTC')
-
-        if is_historical:
-            st.info(f"Historical test mode: simulating market at {current_time_str}")
-            st.write(f"Simulated current price: ${price:.2f}")
-            debug_cols = ['close', 'ema_50', 'ema_200', 'atr']
-            available_cols = [col for col in debug_cols if col in ts_15m.columns]
-            st.write(f"Recent 15m candles: {len(ts_15m)}")
-            st.write("Last timestamp:", ts_15m.index[-1])
-            st.write("Last 5 recent candles:", ts_15m.tail(5)[available_cols])
+        current_time_str = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
 
     df_1d = load_long_term_1d()
     df_4h = load_long_term_4h()
@@ -234,19 +179,13 @@ def run_check(historical_end_time=None, test_dd_limit=None, test_risk_pct=None):
         if ts_15m['low'].iloc[i] == ts_15m['low'].iloc[i-5:i+5].min():
             levels.append(('SUP', round(ts_15m['low'].iloc[i], 2)))
 
-    if is_historical:
-        dd_limit = test_dd_limit
-        risk_of_dd_pct = test_risk_pct
-    else:
-        dd_limit = st.session_state.get("dd_limit")
-        risk_of_dd_pct = st.session_state.get("risk_of_dd_pct", 25.0)
-
+    dd_limit = st.session_state.get("dd_limit")
+    risk_of_dd_pct = st.session_state.get("risk_of_dd_pct", 25.0)
     max_risk_dollars = (dd_limit * risk_of_dd_pct / 100.0) if dd_limit else 50.0
 
-    if is_historical:
-        st.write(f"Test DD limit: ${dd_limit:.2f}")
-        st.write(f"Test risk %: {risk_of_dd_pct}%")
-        st.write(f"Max risk $: ${max_risk_dollars:.2f}")
+    st.write(f"DD limit: ${dd_limit:.2f}")
+    st.write(f"Risk % of DD: {risk_of_dd_pct}%")
+    st.write(f"Max risk $: ${max_risk_dollars:.2f}")
 
     prompt = f"""
 Current UTC: {current_time_str}
@@ -262,319 +201,194 @@ Recent support/resistance fractals: {', '.join([f"{t}@{p}" for t,p in levels[-8:
 
 {long_term_summary}
 
-Account risk limit: max ${max_risk_dollars:.2f} loss per trade (preferred)
+Account risk preference: max ${max_risk_dollars:.2f} loss per trade
 
-Verdict rules (strict):
-- ELITE: win prob ≥80%, exceptional setup
-- HIGH_CONV: win prob ≥65%, strong edge
-- MODERATE: win prob 50–65%
-- LOW_EDGE: win prob <50%
-- NO_EDGE: no valid setup or prob too low
-Always base verdict on your estimated_win_prob — do not assign HIGH_CONV or ELITE to low-prob setups.
+Analyze the current market state using the provided data.
+Be conservative — only mention setups you consider strong.
 
-Propose high-probability setups with confirmation entries only.
-Respond **ONLY** with valid JSON:
+Output in this exact labeled format (no JSON, no extra text):
 
-{{
-  "verdict": "ELITE" | "HIGH_CONV" | "MODERATE" | "LOW_EDGE" | "NO_EDGE",
-  "reason": "short explanation",
-  "entry_type": "LIMIT" | "STOP" | "MARKET" | null,
-  "entry_price": number or null,
-  "sl": number or null,
-  "tp": number or null,
-  "rr": number or null,
-  "estimated_win_prob": number or null,
-  "style": "SCALP" | "SWING" | "BREAKOUT" | "REVERSAL" | "RANGE" | "NONE",
-  "direction": "BULLISH" | "BEARISH" | "NEUTRAL",
-  "reasoning": "1-3 sentences"
-}}
+Bias: bullish / bearish / neutral
+Confidence: high / medium / low / no edge
+Key levels: support/resistance zones (e.g. support 4800–4820)
+Suggested setup (if any):
+Entry zone: approximate range (e.g. 4820–4835)
+Stop zone: approximate range (e.g. below 4790)
+Target zone: approximate range (e.g. 4880–4900)
+Reasoning: your full explanation
+
+If no strong setup, write only:
+Bias: neutral
+Confidence: no edge
+Key levels: none
+Suggested setup: none
+Reasoning: market lacks clear edge at this time
+
+Important: Use the 1D/4H context and recent data to suggest realistic zones based on structure, not arbitrary numbers.
 """
 
     with st.spinner("Consulting AIs..."):
-        g_raw = '{"verdict":"ERROR","reason":"Gemini offline"}'
+        g_raw = "Bias: neutral\nConfidence: no edge\nKey levels: none\nSuggested setup: none\nReasoning: Gemini offline"
         try:
             g_raw = gemini_model.generate_content(prompt, generation_config={"temperature": 0.2}).text.strip()
-        except Exception as e:
-            st.warning(f"Gemini failed: {str(e)}")
+        except:
+            pass
 
-        k_raw = '{"verdict":"ERROR","reason":"Grok offline"}'
+        k_raw = "Bias: neutral\nConfidence: no edge\nKey levels: none\nSuggested setup: none\nReasoning: Grok offline"
         try:
             r = grok_client.chat.completions.create(
                 model="grok-4",
                 messages=[{"role": "user", "content": prompt}],
-                max_tokens=300,
+                max_tokens=400,
                 temperature=0.4
             )
             k_raw = r.choices[0].message.content.strip()
-        except Exception as e:
-            st.warning(f"Grok failed: {str(e)}")
+        except:
+            pass
 
-        c_raw = '{"verdict":"ERROR","reason":"ChatGPT offline"}'
+        c_raw = "Bias: neutral\nConfidence: no edge\nKey levels: none\nSuggested setup: none\nReasoning: ChatGPT offline"
         try:
             resp = openai_client.chat.completions.create(
                 model="gpt-4o-mini",
                 messages=[{"role": "user", "content": prompt}],
-                max_tokens=300,
+                max_tokens=400,
                 temperature=0.5
             )
             c_raw = resp.choices[0].message.content.strip()
-        except Exception as e:
-            st.warning(f"ChatGPT failed: {str(e)}")
+        except:
+            pass
 
-    g_p = parse_ai_output(g_raw)
-    k_p = parse_ai_output(k_raw)
-    c_p = parse_ai_output(c_raw)
+    ai_responses = [
+        {"name": "Gemini", "text": g_raw},
+        {"name": "Grok", "text": k_raw},
+        {"name": "ChatGPT", "text": c_raw}
+    ]
+
+    biases = []
+    confidences = []
+    entry_zones = []
+    stop_zones = []
+    target_zones = []
+    for resp in ai_responses:
+        text = resp["text"]
+        bias_line = [line for line in text.split('\n') if line.strip().startswith("Bias:")]
+        bias = bias_line[0].split(":", 1)[1].strip().upper() if bias_line else "NEUTRAL"
+        biases.append(bias)
+
+        conf_line = [line for line in text.split('\n') if line.strip().startswith("Confidence:")]
+        conf = conf_line[0].split(":", 1)[1].strip().lower() if conf_line else "no edge"
+        confidences.append(conf)
+
+        entry_line = [line for line in text.split('\n') if line.strip().startswith("Entry zone:")]
+        if entry_line:
+            entry_zones.append(entry_line[0].split(":", 1)[1].strip())
+
+        stop_line = [line for line in text.split('\n') if line.strip().startswith("Stop zone:")]
+        if stop_line:
+            stop_zones.append(stop_line[0].split(":", 1)[1].strip())
+
+        target_line = [line for line in text.split('\n') if line.strip().startswith("Target zone:")]
+        if target_line:
+            target_zones.append(target_line[0].split(":", 1)[1].strip())
+
+    consensus_bias = max(set(biases), key=biases.count) if biases else "NEUTRAL"
+    agreement_count = biases.count(consensus_bias)
+
+    high_conf_count = sum(1 for c in confidences if c == "high")
+    med_conf_count = sum(1 for c in confidences if c in ["high", "medium"])
+
+    if agreement_count == 3 and high_conf_count >= 2:
+        verdict = "ELITE"
+    elif agreement_count >= 2 and med_conf_count >= 2:
+        verdict = "HIGH_CONVICTION"
+    else:
+        verdict = "NO_CONVICTION"
 
     lot_size = 0.01
-    lot_note = "Min lot (no valid entry/SL from AIs)"
+    lot_note = "Min lot — no strong consensus or valid setup"
+    risk_warning = ""
+    telegram_zones = ""
 
-    best_entry = best_sl = None
-    for p in [g_p, k_p, c_p]:
-        if p.get("verdict") in ["PARSE_ERROR", "ERROR", "NO_EDGE"]:
-            continue
-        e = p.get("entry_price") or p.get("entry")
-        s = p.get("sl")
-        if isinstance(e, (int, float)) and isinstance(s, (int, float)):
-            best_entry = e
-            best_sl = s
-            break
-
-    if best_entry is not None and best_sl is not None:
+    if verdict in ["ELITE", "HIGH_CONVICTION"] and consensus_bias != "NEUTRAL" and len(entry_zones) >= 2 and len(stop_zones) >= 2:
         try:
-            lot_size, lot_note = calculate_strict_lot_size(best_entry, best_sl, max_risk_dollars, price)
-        except Exception as calc_err:
-            lot_note = f"Lot calc error: {str(calc_err)} — using min lot"
-    else:
-        lot_note = "No valid numeric entry/SL from any AI — using min lot"
+            entry_mins = [float(z.split('–')[0].strip()) for z in entry_zones if '–' in z]
+            entry_maxs = [float(z.split('–')[1].strip()) for z in entry_zones if '–' in z]
+            stop_mins = [float(z.split('–')[0].strip()) for z in stop_zones if '–' in z]
+            stop_maxs = [float(z.split('–')[1].strip()) for z in stop_zones if '–' in z]
+
+            consensus_entry_low = min(entry_mins) if entry_mins else None
+            consensus_entry_high = max(entry_maxs) if entry_maxs else None
+            consensus_stop_low = min(stop_mins) if stop_mins else None
+            consensus_stop_high = max(stop_maxs) if stop_maxs else None
+
+            if consensus_entry_low and consensus_entry_high and consensus_stop_low and consensus_stop_high:
+                avg_entry = (consensus_entry_low + consensus_entry_high) / 2
+                worst_sl = consensus_stop_low if consensus_bias == "BULLISH" else consensus_stop_high
+                theoretical_risk = abs(avg_entry - worst_sl) * 100
+
+                if theoretical_risk > max_risk_dollars:
+                    risk_warning = f"**RISK WARNING**: Consensus stop zone implies \~${theoretical_risk:.2f} risk — exceeds your ${max_risk_dollars:.2f} limit. Review or skip."
+                else:
+                    lot_size, lot_note = calculate_strict_lot_size(avg_entry, worst_sl, max_risk_dollars, price)
+                    telegram_zones = f"Consensus entry zone: {consensus_entry_low:.0f}–{consensus_entry_high:.0f}\nTightest stop zone: {'below' if consensus_bias == 'BULLISH' else 'above'} {worst_sl:.0f}"
+        except:
+            lot_note = "Zone parsing failed — min lot used"
 
     st.divider()
-    st.subheader("AI Verdicts")
+    st.subheader("AI Consensus & Setup Review")
 
-    def format_verdict(p, ai_name, lot=None, note=""):
-        if p["verdict"] == "PARSE_ERROR":
-            return f"**{ai_name}** — Parse error: {p['reason']}"
+    st.markdown(f"**Consensus Bias:** {consensus_bias}")
+    st.markdown(f"**Agreement Level:** {agreement_count}/3 AIs")
+    st.markdown(f"**Verdict:** {verdict}")
+    st.markdown(f"**Lot Size:** {lot_size:.2f} ({lot_note})")
+    if risk_warning:
+        st.error(risk_warning)
 
-        verdict = p["verdict"]
-        colors = {
-            "ELITE": "#2ecc71", "HIGH_CONV": "#3498db",
-            "MODERATE": "#f1c40f", "LOW_EDGE": "#e67e22",
-            "NO_EDGE": "#95a5a6", "PARSE_ERROR": "#7f8c8d"
-        }
-        color = colors.get(verdict, "#7f8c8d")
+    st.markdown("**Important Disclaimer**")
+    st.markdown("Agreement among AIs reflects narrative clarity and obviousness, NOT statistical edge. Obvious setups are often crowded and prone to chop/fakeouts in Gold. Use only as a second opinion — never as a signal. Always verify independently.")
 
-        entry_type = p.get('entry_type', '—')
-        entry_price_val = p.get('entry_price')
-        if isinstance(entry_price_val, (int, float)):
-            entry_price_str = f"${entry_price_val:.2f}"
-        else:
-            entry_price_str = "—"
-        entry_str = f"{entry_type} @ {entry_price_str}"
+    for resp in ai_responses:
+        st.markdown(f"**{resp['name']} Response:**\n\n{resp['text']}")
 
-        sl_val = p.get('sl')
-        sl_str = f"${sl_val:.2f}" if isinstance(sl_val, (int, float)) else "—"
-
-        tp_val = p.get('tp')
-        tp_str = f"${tp_val:.2f}" if isinstance(tp_val, (int, float)) else "—"
-
-        rr_val = p.get('rr')
-        rr_str = f"1:{rr_val:.1f}" if isinstance(rr_val, (int, float)) else "—"
-
-        prob_val = p.get('estimated_win_prob')
-        prob_str = f"{prob_val}%" if isinstance(prob_val, (int, float)) else "—"
-
-        risk_dollars_val = p.get('risk_dollars')
-        risk_pct_val     = p.get('risk_pct_of_dd')
-        exceed_flag      = p.get('exceeds_preferred_risk', False)
-
-        if isinstance(risk_dollars_val, (int, float)):
-            dollars_part = f"${risk_dollars_val:.2f}"
-        else:
-            dollars_part = "—"
-
-        if isinstance(risk_pct_val, (int, float)):
-            pct_part = f"{risk_pct_val:.1f}%"
-        else:
-            pct_part = "—"
-
-        risk_str = f"{dollars_part} ({pct_part} of DD)"
-        exceed_warning = '<span style="color:#e74c3c; font-weight:bold;">EXCEEDS preferred risk!</span>' if exceed_flag else ""
-
-        if isinstance(entry_price_val, (int, float)) and price and abs(entry_price_val - price) / price > 0.10:
-            entry_str += ' <span style="color:#e74c3c;">(unrealistic distance!)</span>'
-
-        lot_str = f"{lot:.2f}" if lot is not None else "—"
-
-        html = f"""
-        <div style="background:{color}11; border-left:5px solid {color}; padding:16px 20px; margin:16px 0; border-radius:8px; box-shadow:0 2px 8px rgba(0,0,0,0.1);">
-            <div style="font-size:1.3em; font-weight:bold; color:{color}; margin-bottom:8px;">
-                {ai_name} — {verdict}
-            </div>
-            <div style="margin-bottom:12px; color:#555;">{p['reason']}</div>
-            <div style="display:grid; grid-template-columns:1fr 1fr; gap:12px; margin:12px 0;">
-                <div><strong>Direction:</strong> {p['direction']}</div>
-                <div><strong>Style:</strong> {p['style']}</div>
-                <div><strong>Entry:</strong> {entry_str}</div>
-                <div><strong>SL:</strong> {sl_str}</div>
-                <div><strong>TP:</strong> {tp_str}</div>
-                <div><strong>RR:</strong> {rr_str}</div>
-                <div><strong>Est. Win Prob:</strong> {prob_str}</div>
-                <div><strong>Risk:</strong> {risk_str} {exceed_warning}</div>
-                <div><strong>Lot size:</strong> {lot_str}</div>
-            </div>
-            <div style="color:#555; font-size:0.9em; margin:8px 0;">{note or ''}</div>
-            <div style="font-style:italic; color:#444; margin-top:12px;">{p['reasoning']}</div>
-        </div>
-        """
-        return html
-
-    col1, col2, col3 = st.columns(3)
-    with col1: st.markdown(format_verdict(g_p, "Gemini",   lot_size, lot_note), unsafe_allow_html=True)
-    with col2: st.markdown(format_verdict(k_p, "Grok",     lot_size, lot_note), unsafe_allow_html=True)
-    with col3: st.markdown(format_verdict(c_p, "ChatGPT",  lot_size, lot_note), unsafe_allow_html=True)
-
-    high_verdicts = [p for p in [g_p, k_p, c_p] if p["verdict"] in ["ELITE", "HIGH_CONV"] and p.get("estimated_win_prob", 0) >= 60]
-    if len(high_verdicts) >= 2:
-        directions = [p["direction"] for p in high_verdicts if p["direction"] != "NEUTRAL"]
-        if len(set(directions)) == 1 and directions:
-            direction = directions[0]
-
-            valid_entries = []
-            for p in high_verdicts:
-                e = p.get("entry_price") or p.get("entry")
-                if isinstance(e, (int, float)) and abs(e - price) / price < 0.05:
-                    valid_entries.append({
-                        "entry": e,
-                        "sl": p.get("sl"),
-                        "tp": p.get("tp"),
-                        "source": p
-                    })
-
-            if len(valid_entries) >= 2:
-                entries_sorted = sorted(valid_entries, key=lambda x: x["entry"])
-                consensus_entry = entries_sorted[0]["entry"]
-                tps = [v["tp"] for v in valid_entries if isinstance(v["tp"], (int, float))]
-                consensus_tp = np.median(tps) if tps else "—"
-                sls = [v["sl"] for v in valid_entries if isinstance(v["sl"], (int, float))]
-                consensus_sl = min(sls) if sls else "—"
-
-                msg = (
-                    f"**Consensus High Conviction ({len(high_verdicts)} AIs)**\n"
-                    f"Direction: {direction}\n"
-                    f"Entry (lowest/safest): LIMIT @ ${consensus_entry:.2f}\n"
-                    f"SL (tightest): ${consensus_sl:.2f}\n"
-                    f"TP (median): ${consensus_tp if isinstance(consensus_tp, (int, float)) else consensus_tp:.2f}\n"
-                    f"Lot size: {lot_size:.2f} ({lot_note})\n"
-                )
-                send_telegram(msg, priority="high" if len(high_verdicts) == 3 else "normal")
-                st.success("Consensus alert sent!")
-            else:
-                st.info("No clustered valid entries — no alert")
-        else:
-            st.info("Direction mismatch — no alert")
-    else:
-        st.info("No strong consensus — no alert")
+    if verdict in ["ELITE", "HIGH_CONVICTION"] and consensus_bias != "NEUTRAL" and not risk_warning:
+        msg = f"**{verdict} on {consensus_bias}** ({agreement_count}/3 AIs)\n{telegram_zones}\nLot: {lot_size:.2f} ({lot_note})\n{long_term_summary.strip()}"
+        send_telegram(msg, priority="high" if verdict == "ELITE" else "normal")
 
 st.set_page_config(page_title="Gold Sentinel", page_icon="🥇", layout="wide")
 st.title("🥇 Gold Sentinel – AI-Driven Gold Setups")
 st.caption(f"Gemini • Grok • ChatGPT | {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
 
-with st.expander("Prop Challenge / Risk Settings (required for lot sizing)", expanded=True):
-    default_balance = st.session_state.get("balance", 5029.00)
+with st.expander("Risk Settings", expanded=True):
     default_dd = st.session_state.get("dd_limit", 251.45)
-    default_risk_pct = st.session_state.get("risk_of_dd_pct", 25.0)
+    default_pct = st.session_state.get("risk_of_dd_pct", 25.0)
 
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        balance_input = st.number_input("Current Balance ($)", min_value=0.0, step=0.01, value=default_balance, format="%.2f")
-    with col2:
-        dd_input = st.number_input("Daily Drawdown Limit ($)", min_value=0.0, step=1.0, value=default_dd, format="%.2f")
-    with col3:
-        risk_input = st.number_input("Preferred risk % of Daily DD", min_value=1.0, max_value=100.0, value=default_risk_pct, step=1.0, format="%.0f")
-
-    if st.button("Save & Apply Settings", type="primary", use_container_width=True):
-        st.session_state.balance = balance_input
-        st.session_state.dd_limit = dd_input
-        st.session_state.risk_of_dd_pct = risk_input
-        st.success("Settings saved!")
-        st.rerun()
-
-with st.expander("Historical Test Mode (optional backtesting)", expanded=False):
-    st.info("Select a PAST date/time to simulate market state exactly then. Uses recent API data + optional long-term CSV files.")
-    
     col1, col2 = st.columns(2)
     with col1:
-        test_date = st.date_input("Test Date", value=datetime.now(timezone.utc).date() - timedelta(days=1))
+        dd_limit = st.number_input("Daily Drawdown Limit ($)", min_value=0.0, value=default_dd, format="%.2f")
     with col2:
-        test_time = st.time_input("Test Time (UTC)", value=datetime.strptime("14:30", "%H:%M").time())
+        risk_pct = st.number_input("Risk % of DD", min_value=1, max_value=100, value=default_pct, format="%d")
 
-    test_dd_limit = st.number_input("Daily Drawdown Limit ($) for this test", 
-                                    min_value=0.0, step=1.0, 
-                                    value=st.session_state.get("dd_limit", 251.45), 
-                                    format="%.2f")
-    test_risk_pct = st.number_input("Risk % of Daily DD for this test", 
-                                    min_value=1.0, max_value=100.0, 
-                                    value=st.session_state.get("risk_of_dd_pct", 25.0), 
-                                    step=1.0, format="%.0f")
+    if st.button("Save Settings"):
+        st.session_state.dd_limit = dd_limit
+        st.session_state.risk_of_dd_pct = risk_pct
+        st.success("Settings saved")
 
-    test_datetime = datetime.combine(test_date, test_time, tzinfo=timezone.utc)
-
-    if st.button("Run Historical Test"):
-        if test_datetime >= datetime.now(timezone.utc):
-            st.error("Cannot test future or current time — pick a past moment.")
-        else:
-            run_check(historical_end_time=test_datetime, 
-                      test_dd_limit=test_dd_limit, 
-                      test_risk_pct=test_risk_pct)
-
-    st.markdown("**Download long-term history in two parts (combine later if needed)**")
+with st.expander("Update Long-Term History (weekly)", expanded=False):
+    st.info("Download fresh context files for 1D and 4H (combine or upload separately). Update once a week when market is closed.")
+    
     col_a, col_b = st.columns(2)
 
     with col_a:
-        if st.button("Download 4H data (60 days)"):
-            df_4h = download_4h_data()
-            if df_4h is not None:
-                st.download_button("Download 4H CSV", df_4h.to_csv(), "longterm_history_4H.csv", "text/csv")
+        if st.button("Download 4H (60 days)"):
+            df = download_4h_data()
+            if df is not None:
+                st.download_button("Save 4H CSV", df.to_csv(), "longterm_history_4H.csv", "text/csv")
 
     with col_b:
-        if st.button("Download 1D data (60 days)"):
-            df_1d = download_1d_data()
-            if df_1d is not None:
-                st.download_button("Download 1D CSV", df_1d.to_csv(), "longterm_history_1D.csv", "text/csv")
+        if st.button("Download 1D (60 days)"):
+            df = download_1d_data()
+            if df is not None:
+                st.download_button("Save 1D CSV", df.to_csv(), "longterm_history_1D.csv", "text/csv")
 
-    if 'last_ts_15m' in st.session_state and st.session_state['last_ts_15m'] is not None:
-        df = st.session_state['last_ts_15m']
-        csv_buffer = io.StringIO()
-        df.to_csv(csv_buffer)
-        csv_data = csv_buffer.getvalue()
-
-        filename = f"gold_15m_snapshot_{st.session_state.get('last_test_datetime', 'unknown').strftime('%Y%m%d_%H%M')}.csv" if st.session_state.get('last_test_datetime') else "gold_15m_snapshot.csv"
-
-        st.download_button(
-            label="Download Recent 15m Snapshot (CSV)",
-            data=csv_data,
-            file_name=filename,
-            mime="text/csv",
-            help="Exact recent data slice used for this test"
-        )
-    else:
-        st.info("Run a test first to enable recent snapshot download.")
-
-if "last_check_time" not in st.session_state:
-    st.session_state.last_check_time = 0
-
-auto_enabled = st.checkbox(f"Auto-run every {CHECK_INTERVAL_MIN} minutes (keep tab open)", value=False)
-
-if auto_enabled:
-    now = time.time()
-    time_since = now - st.session_state.last_check_time
-    if time_since >= CHECK_INTERVAL_MIN * 60:
-        st.session_state.last_check_time = now
-        run_check()
-    else:
-        remaining = int(CHECK_INTERVAL_MIN * 60 - time_since)
-        st.caption(f"Next auto-run in {remaining // 60} min {remaining % 60} sec")
-else:
-    st.info("Auto mode off — use the button below")
-
-if st.button("📡 Run Analysis Now (Live)", type="primary", use_container_width=True):
+if st.button("Run Live Analysis", type="primary", use_container_width=True):
     run_check()
