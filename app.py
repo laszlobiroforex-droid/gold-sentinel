@@ -92,37 +92,22 @@ def fetch_recent_1h(outputsize=200):
 
 def fetch_longterm_4h_1d():
     try:
+        # 4H — minimal to fit credit limit
         ts_4h = td.time_series(symbol="XAU/USD", interval="4h", outputsize=360, timezone="UTC")
-        ts_4h = ts_4h.with_rsi(time_period=14)
-        ts_4h = ts_4h.with_ema(time_period=21)
         ts_4h = ts_4h.with_ema(time_period=50)
         ts_4h = ts_4h.with_ema(time_period=200)
-        ts_4h = ts_4h.with_macd(fast_period=12, slow_period=26, signal_period=9)
-        ts_4h = ts_4h.with_adx(time_period=14)
-        ts_4h = ts_4h.with_bbands(time_period=20, sd=2)
+        ts_4h = ts_4h.with_rsi(time_period=14)
         ts_4h = ts_4h.with_atr(time_period=14)
 
+        # 1D — minimal
         ts_1d = td.time_series(symbol="XAU/USD", interval="1day", outputsize=60, timezone="UTC")
-        ts_1d = ts_1d.with_rsi(time_period=14)
-        ts_1d = ts_1d.with_ema(time_period=21)
         ts_1d = ts_1d.with_ema(time_period=50)
         ts_1d = ts_1d.with_ema(time_period=200)
-        ts_1d = ts_1d.with_macd(fast_period=12, slow_period=26, signal_period=9)
-        ts_1d = ts_1d.with_adx(time_period=14)
-        ts_1d = ts_1d.with_bbands(time_period=20, sd=2)
+        ts_1d = ts_1d.with_rsi(time_period=14)
         ts_1d = ts_1d.with_atr(time_period=14)
 
         df_4h = ts_4h.as_pandas()
         df_1d = ts_1d.as_pandas()
-
-        df_4h = df_4h.rename(columns={
-            'macd_macd': 'macd', 'macd_signal': 'macd_signal', 'macd_hist': 'macd_hist',
-            'bbands_upper': 'bb_upper', 'bbands_middle': 'bb_middle', 'bbands_lower': 'bb_lower'
-        })
-        df_1d = df_1d.rename(columns={
-            'macd_macd': 'macd', 'macd_signal': 'macd_signal', 'macd_hist': 'macd_hist',
-            'bbands_upper': 'bb_upper', 'bbands_middle': 'bb_middle', 'bbands_lower': 'bb_lower'
-        })
 
         combined = pd.concat([df_4h, df_1d]).sort_index(ascending=True)
         return combined
@@ -159,7 +144,7 @@ def run_check(historical_end_time=None, test_dd_limit=None, test_risk_pct=None):
         if is_historical:
             st.info(f"Historical test mode: simulating market at {current_time_str}")
             st.write(f"Simulated current price: ${price:.2f}")
-            debug_cols = ['close', 'rsi', 'ema_21', 'ema_50', 'ema_200', 'atr', 'adx', 'macd', 'bb_upper']
+            debug_cols = ['close', 'rsi', 'ema_50', 'ema_200', 'atr']
             available_cols = [col for col in debug_cols if col in ts_15m.columns]
             st.write(f"Recent 15m candles: {len(ts_15m)}")
             st.write("Last timestamp:", ts_15m.index[-1])
@@ -170,13 +155,9 @@ def run_check(historical_end_time=None, test_dd_limit=None, test_risk_pct=None):
     if long_term_df is not None and not long_term_df.empty:
         lt_price = long_term_df['close'].iloc[-1]
         lt_trend = "bullish" if lt_price > long_term_df['ema_200'].iloc[-1] else "bearish"
-        lt_adx = long_term_df.get('adx', pd.Series([None])).iloc[-1]
-        lt_rsi_avg = long_term_df.get('rsi', pd.Series([None])).iloc[-10:].mean()
         long_term_summary = f"""
 Long-term context (4H/1D last 60 days):
 - Trend: {lt_trend} (price vs EMA200)
-- ADX: {lt_adx if pd.notna(lt_adx) else 'N/A'} → {'strong trend' if isinstance(lt_adx, (int,float)) and lt_adx > 25 else 'ranging'}
-- RSI 1D avg last 10 days: {lt_rsi_avg:.1f if pd.notna(lt_rsi_avg) else 'N/A'}
 """
 
     latest_15m = ts_15m.iloc[-1]
@@ -184,7 +165,6 @@ Long-term context (4H/1D last 60 days):
     atr = latest_15m.get('atr', 10.0)
     ema200_15m = latest_15m.get('ema_200', price)
     ema50_15m  = latest_15m.get('ema_50', price)
-    ema21_15m  = latest_15m.get('ema_21', 'N/A')
 
     ema200_1h = ts_1h.iloc[-1].get('ema_200', price) if ts_1h is not None and not ts_1h.empty else price
 
@@ -216,7 +196,7 @@ Recent market data (15m):
 Price: ${price:.2f}
 RSI (15m): {rsi:.1f}
 ATR (15m): {atr:.2f}
-EMA21 / EMA50 / EMA200 (15m): {ema21_15m if isinstance(ema21_15m, (int,float)) else ema21_15m} / {ema50_15m:.2f} / {ema200_15m:.2f}
+EMA50 / EMA200 (15m): {ema50_15m:.2f} / {ema200_15m:.2f}
 EMA200 (1h): {ema200_1h:.2f}
 
 Recent support/resistance fractals: {', '.join([f"{t}@{p}" for t,p in levels[-8:]]) or 'None'}
@@ -498,7 +478,7 @@ with st.expander("Historical Test Mode (optional backtesting)", expanded=False):
                 help="Rename to history_longterm.csv and upload to app root"
             )
         else:
-            st.error("Failed to fetch long-term data — check API key or network")
+            st.error("Failed to fetch long-term data — check API key, network, or rate limits")
 
     # Download recent snapshot
     if 'last_ts_15m' in st.session_state and st.session_state['last_ts_15m'] is not None:
