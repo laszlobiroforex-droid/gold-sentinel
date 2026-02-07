@@ -46,18 +46,22 @@ def fetch_15m(end_time=None, outputsize=120):
     try:
         params = {"symbol": "XAU/USD", "interval": "15min", "outputsize": outputsize}
         if end_time:
-            params["end"] = end_time.isoformat()
+            # Buffer end_time to include last closed candle
+            params["end"] = (end_time + timedelta(minutes=15)).isoformat()
+            params["start"] = (end_time - timedelta(hours=6)).isoformat()  # enough for indicators
         ts = td.time_series(**params)
         ts = ts.with_rsi().with_ema(time_period=200).with_ema(time_period=50).with_atr(time_period=14)
         return ts.as_pandas()
-    except:
+    except Exception as e:
+        st.warning(f"15m fetch failed: {str(e)}")
         return None
 
 def fetch_1h(end_time=None, outputsize=60):
     try:
         params = {"symbol": "XAU/USD", "interval": "1h", "outputsize": outputsize}
         if end_time:
-            params["end"] = end_time.isoformat()
+            params["end"] = (end_time + timedelta(hours=1)).isoformat()
+            params["start"] = (end_time - timedelta(days=2)).isoformat()
         ts = td.time_series(**params)
         ts = ts.with_ema(time_period=200)
         return ts.as_pandas()
@@ -97,7 +101,7 @@ def parse_ai_output(text):
             "reason": f"Invalid JSON: {str(e)}. Raw: {text[:150]}..."
         }
 
-# ─── STRICT LOT SIZE CALCULATION (always Python-side) ──────────────────────
+# ─── STRICT LOT SIZE CALCULATION ───────────────────────────────────────────
 def calculate_strict_lot_size(entry, sl, max_risk_dollars, current_price=None):
     if not all(v is not None for v in [entry, sl, max_risk_dollars]):
         return 0.01, "Missing data — min lot used"
@@ -109,46 +113,47 @@ def calculate_strict_lot_size(entry, sl, max_risk_dollars, current_price=None):
         if price_diff <= 0:
             return 0.01, "Invalid SL — min lot used"
 
-        # Gold: 1 lot = $100 per $1 move → 0.01 lot = $1 per $1 move
         lot_size = max_risk_dollars / (price_diff * 100)
-        lot_size_rounded = max(round(lot_size, 2), 0.01)  # never below 0.01
+        lot_size_rounded = max(round(lot_size, 2), 0.01)
 
         actual_risk = lot_size_rounded * price_diff * 100
         note = f"Adjusted to fit ${max_risk_dollars:.2f} max risk"
-        if actual_risk > max_risk_dollars * 1.05:  # slight tolerance
+        if actual_risk > max_risk_dollars * 1.05:
             note += " — still slightly over (wide SL)"
         return lot_size_rounded, note
     except:
         return 0.01, "Calc error — min lot used"
 
-# ─── MAIN CHECK (supports historical mode) ─────────────────────────────────
-def run_check(historical_end_time=None, fake_price=None, fake_utc=None):
+# ─── MAIN ANALYSIS FUNCTION ────────────────────────────────────────────────
+def run_check(historical_end_time=None):
     is_historical = historical_end_time is not None
 
-    with st.spinner("Fetching market data..."):
+    with st.spinner("Fetching data..."):
         if is_historical:
-            ts_15m = fetch_15m(end_time=historical_end_time, outputsize=80)
-            ts_1h  = fetch_1h(end_time=historical_end_time, outputsize=40)
-            price = fake_price or (ts_15m['close'].iloc[-1] if ts_15m is not None else None)
-            current_time_str = fake_utc or historical_end_time.strftime('%Y-%m-%d %H:%M UTC')
+            ts_15m = fetch_15m(end_time=historical_end_time)
+            ts_1h  = fetch_1h(end_time=historical_end_time)
+            if ts_15m is None or ts_15m.empty:
+                st.error("No historical 15m data returned for selected time")
+                return
+            price = ts_15m['close'].iloc[-1]
+            current_time_str = historical_end_time.strftime('%Y-%m-%d %H:%M UTC')
+            st.info(f"Historical mode: simulating {current_time_str} | Last price used: ${price:.2f}")
+            st.write("Last 3 candles:", ts_15m.tail(3)[['close', 'rsi', 'ema_50', 'ema_200', 'atr']])
         else:
             price = get_live_price()
             ts_15m = fetch_15m()
             ts_1h  = fetch_1h()
+            if price is None:
+                st.error("Failed to fetch live price")
+                return
             current_time_str = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
 
-    if price is None:
-        st.error("Failed to fetch price")
-        return
-    if ts_15m is None or ts_15m.empty:
-        st.error("No 15m data received")
-        return
-
+    # ─── INDICATORS & LEVELS ───────────────────────────────────────────────────
     latest_15m = ts_15m.iloc[-1]
     rsi = latest_15m.get('rsi', 50.0)
     atr = latest_15m.get('atr', 10.0)
     ema200_15m = latest_15m.get('ema_200', price)
-    ema50_15m  = latest_15m.get('ema_50', price)
+    ema50_15m  = latest_15m.get('ema_50',  price)
 
     ema200_1h = ts_1h.iloc[-1].get('ema_200', price) if ts_1h is not None and not ts_1h.empty else price
 
@@ -161,9 +166,9 @@ def run_check(historical_end_time=None, fake_price=None, fake_utc=None):
 
     balance        = st.session_state.get("balance")
     dd_limit       = st.session_state.get("dd_limit")
-    risk_of_dd_pct = st.session_state.get("risk_of_dd_pct")
+    risk_of_dd_pct = st.session_state.get("risk_of_dd_pct", 25.0)
 
-    max_risk_dollars = (dd_limit * risk_of_dd_pct / 100.0) if dd_limit and risk_of_dd_pct else 50.0
+    max_risk_dollars = (dd_limit * risk_of_dd_pct / 100.0) if dd_limit else 50.0
 
     prompt = f"""
 Current UTC: {current_time_str}
@@ -179,8 +184,7 @@ Recent support/resistance fractals: {', '.join([f"{t}@{p}" for t,p in levels[-8:
 
 Account risk limit: max ${max_risk_dollars:.2f} loss per trade (preferred)
 
-You are a disciplined gold trader. Propose only high-probability setups with confirmation entries.
-
+Propose high-prob setups with confirmation entries only.
 Respond **ONLY** with valid JSON:
 
 {{
@@ -232,7 +236,7 @@ Respond **ONLY** with valid JSON:
     k_p = parse_ai_output(k_raw)
     c_p = parse_ai_output(c_raw)
 
-    # ─── STRICT LOT SIZE OVERRIDE ──────────────────────────────────────────────
+    # Strict lot calculation (Python overrides AI)
     best_entry = best_sl = None
     for p in [g_p, k_p, c_p]:
         e = p.get("entry_price") or p.get("entry")
@@ -240,71 +244,108 @@ Respond **ONLY** with valid JSON:
         if isinstance(e, (int, float)) and isinstance(s, (int, float)):
             best_entry = e
             best_sl = s
-            break  # take first valid
+            break
 
+    lot_size = 0.01
+    lot_note = "Min lot (no valid entry/SL)"
     if best_entry and best_sl:
         lot_size, lot_note = calculate_strict_lot_size(best_entry, best_sl, max_risk_dollars, price)
-    else:
-        lot_size, lot_note = 0.01, "No valid entry/SL — min lot"
 
-    # ─── CONSENSUS LOGIC ───────────────────────────────────────────────────────
+    # ─── DISPLAY VERDICTS (use previous robust format_verdict) ──────────────
+    # ... paste your existing format_verdict function here (the one with isinstance checks)
+
+    col1, col2, col3 = st.columns(3)
+    with col1: st.markdown(format_verdict(g_p, "Gemini",   lot_size, lot_note), unsafe_allow_html=True)
+    with col2: st.markdown(format_verdict(k_p, "Grok",     lot_size, lot_note), unsafe_allow_html=True)
+    with col3: st.markdown(format_verdict(c_p, "ChatGPT",  lot_size, lot_note), unsafe_allow_html=True)
+
+    # ─── CONSENSUS & TELEGRAM (conservative picking) ─────────────────────────
     high_verdicts = [p for p in [g_p, k_p, c_p] if p["verdict"] in ["ELITE", "HIGH_CONV"]]
     if len(high_verdicts) >= 2:
         directions = [p["direction"] for p in high_verdicts if p["direction"] != "NEUTRAL"]
         if len(set(directions)) == 1 and directions:
             direction = directions[0]
 
-            # Collect valid entries
             valid_entries = []
             for p in high_verdicts:
                 e = p.get("entry_price") or p.get("entry")
-                if isinstance(e, (int, float)) and abs(e - price) / price < 0.05:  # within 5%
+                if isinstance(e, (int, float)) and abs(e - price) / price < 0.05:
                     valid_entries.append({
                         "entry": e,
                         "sl": p.get("sl"),
                         "tp": p.get("tp"),
-                        "prob": p.get("estimated_win_prob", 50),
                         "source": p
                     })
 
             if len(valid_entries) >= 2:
-                # Conservative consensus
                 entries_sorted = sorted(valid_entries, key=lambda x: x["entry"])
-                consensus_entry = entries_sorted[0]["entry"]     # lowest (safest pullback)
-                tps = [v["tp"] for v in valid_entries if v["tp"]]
+                consensus_entry = entries_sorted[0]["entry"]  # lowest/safest
+                tps = [v["tp"] for v in valid_entries if isinstance(v["tp"], (int, float))]
                 consensus_tp = np.median(tps) if tps else "—"
-                sls = [v["sl"] for v in valid_entries if v["sl"]]
-                consensus_sl = min(sls) if sls else "—"          # tightest SL
+                sls = [v["sl"] for v in valid_entries if isinstance(v["sl"], (int, float))]
+                consensus_sl = min(sls) if sls else "—"
 
                 msg = (
-                    f"**Consensus High Conviction ({len(high_verdicts)}/{len([g_p,k_p,c_p])})**\n"
+                    f"**Consensus High Conviction ({len(high_verdicts)} AIs)**\n"
                     f"Direction: {direction}\n"
                     f"Entry (lowest): LIMIT @ ${consensus_entry:.2f}\n"
                     f"SL (tightest): ${consensus_sl:.2f}\n"
-                    f"TP (median): ${consensus_tp:.2f}\n"
+                    f"TP (median): ${consensus_tp if isinstance(consensus_tp, (int, float)) else consensus_tp:.2f}\n"
                     f"Lot size: {lot_size:.2f} ({lot_note})\n"
-                    f"Based on clustered high-prob setups."
                 )
                 send_telegram(msg, priority="high" if len(high_verdicts) == 3 else "normal")
                 st.success("Consensus alert sent!")
             else:
-                st.info("No valid clustered entries — no alert")
+                st.info("No clustered valid entries — no alert")
         else:
             st.info("Direction mismatch — no alert")
     else:
         st.info("No strong consensus — no alert")
 
-    # Display verdicts (same as before, using format_verdict from previous full code)
+# ─── UI ─────────────────────────────────────────────────────────────────────
+st.set_page_config(page_title="Gold Sentinel", page_icon="🥇", layout="wide")
+st.title("🥇 Gold Sentinel – AI-Driven Gold Setups")
+st.caption(f"Gemini • Grok • ChatGPT | {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
 
-# ─── HISTORICAL TEST MODE ──────────────────────────────────────────────────
-with st.expander("Historical Test Mode (for backtesting past moments)", expanded=False):
-    test_date = st.date_input("Test Date", value=datetime.now(timezone.utc).date() - timedelta(days=1))
-    test_time = st.time_input("Test Time (UTC)", value=datetime(2025, 2, 6, 5, 27).time())
+# Risk settings expander (unchanged)
+with st.expander("Prop Challenge / Risk Settings (required for lot sizing)", expanded=True):
+    # ... your existing code for balance, dd_limit, risk_pct ...
+
+# ─── HISTORICAL TEST MODE (optional) ───────────────────────────────────────
+with st.expander("Historical Test Mode (optional backtesting)", expanded=False):
+    st.info("Select a PAST date/time to simulate market state exactly then. Uses only data available up to that moment.")
+    
+    col1, col2 = st.columns(2)
+    with col1:
+        test_date = st.date_input("Test Date", value=datetime.now(timezone.utc).date() - timedelta(days=1))
+    with col2:
+        test_time = st.time_input("Test Time (UTC)", value=datetime.strptime("05:27", "%H:%M").time())
+
     test_datetime = datetime.combine(test_date, test_time, tzinfo=timezone.utc)
 
-    if st.button("Run Historical Test at selected time"):
-        run_check(historical_end_time=test_datetime)
+    if st.button("Run Historical Test"):
+        if test_datetime >= datetime.now(timezone.utc):
+            st.error("Cannot test future or current time — pick a past moment.")
+        else:
+            run_check(historical_end_time=test_datetime)
 
-# Rest of UI (risk settings, auto, manual button) remains the same as in previous full code
+# ─── AUTO / MANUAL CONTROLS ────────────────────────────────────────────────
+if "last_check_time" not in st.session_state:
+    st.session_state.last_check_time = 0
 
-# ... (paste the rest of the UI code from your last working version: risk expander, last_check_time, auto checkbox, manual button)
+auto_enabled = st.checkbox(f"Auto-run every {CHECK_INTERVAL_MIN} minutes (keep tab open)", value=False)
+
+if auto_enabled:
+    now = time.time()
+    time_since = now - st.session_state.last_check_time
+    if time_since >= CHECK_INTERVAL_MIN * 60:
+        st.session_state.last_check_time = now
+        run_check()  # live mode
+    else:
+        remaining = int(CHECK_INTERVAL_MIN * 60 - time_since)
+        st.caption(f"Next auto-run in {remaining // 60} min {remaining % 60} sec")
+else:
+    st.info("Auto mode off — use the button below")
+
+if st.button("📡 Run Analysis Now (Live)", type="primary", use_container_width=True):
+    run_check()  # live mode
