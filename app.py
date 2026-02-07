@@ -8,10 +8,12 @@ from openai import OpenAI
 import requests
 import numpy as np
 import pandas as pd
+import os
 import io
 
 # ─── CONFIG ────────────────────────────────────────────────────────────────
 CHECK_INTERVAL_MIN = 30
+HISTORY_CSV_PATH = "history.csv"  # Place your CSV here
 
 # ─── API INIT ──────────────────────────────────────────────────────────────
 td = TDClient(apikey=st.secrets["TWELVE_DATA_KEY"])
@@ -44,9 +46,30 @@ def get_live_price():
     except:
         return None
 
-def fetch_15m(target_end_time=None, outputsize=200):
+def load_from_csv_if_exists():
+    if os.path.exists(HISTORY_CSV_PATH):
+        try:
+            df = pd.read_csv(HISTORY_CSV_PATH, parse_dates=['datetime'], index_col='datetime')
+            df.index = pd.to_datetime(df.index, utc=True).tz_convert(None)  # Make naive for comparison
+            st.success(f"Loaded historical data from {HISTORY_CSV_PATH} ({len(df)} rows)")
+            return df
+        except Exception as e:
+            st.error(f"Failed to load {HISTORY_CSV_PATH}: {str(e)}")
+    return None
+
+def fetch_15m(target_end_time=None, outputsize=2000):  # Increased for wider range
+    # First try CSV if exists
+    df = load_from_csv_if_exists()
+    if df is not None:
+        if target_end_time:
+            target_pd = pd.Timestamp(target_end_time).tz_localize(None)
+            df = df[df.index <= target_pd]
+            df = df.sort_index(ascending=True)
+        return df
+
+    # Fallback to API
     try:
-        ts = td.time_series(symbol="XAU/USD", interval="15min", outputsize=outputsize)
+        ts = td.time_series(symbol="XAU/USD", interval="15min", outputsize=outputsize, timezone="UTC")
         ts = ts.with_rsi().with_ema(time_period=200).with_ema(time_period=50).with_atr(time_period=14)
         df = ts.as_pandas()
         if target_end_time:
@@ -54,16 +77,15 @@ def fetch_15m(target_end_time=None, outputsize=200):
             df.index = df.index.tz_localize(None) if df.index.tz is not None else df.index
             df = df[df.index <= target_pd]
             df = df.sort_index(ascending=True)
-            if df.empty:
-                st.warning(f"No 15m candles ≤ {target_end_time}")
         return df
     except Exception as e:
-        st.warning(f"15m fetch failed: {str(e)}")
+        st.warning(f"15m API fetch failed: {str(e)}")
         return None
 
-def fetch_1h(target_end_time=None, outputsize=100):
+def fetch_1h(target_end_time=None, outputsize=500):
+    # CSV not used for 1h (only 15m for now)
     try:
-        ts = td.time_series(symbol="XAU/USD", interval="1h", outputsize=outputsize)
+        ts = td.time_series(symbol="XAU/USD", interval="1h", outputsize=outputsize, timezone="UTC")
         ts = ts.with_ema(time_period=200)
         df = ts.as_pandas()
         if target_end_time:
@@ -138,8 +160,8 @@ def run_check(historical_end_time=None, test_dd_limit=None, test_risk_pct=None):
 
     with st.spinner("Fetching data..."):
         if is_historical:
-            ts_15m = fetch_15m(target_end_time=historical_end_time)
-            ts_1h  = fetch_1h(target_end_time=historical_end_time)
+            ts_15m = fetch_15m(target_end_time=historical_end_time, outputsize=2000)
+            ts_1h  = fetch_1h(target_end_time=historical_end_time, outputsize=500)
             if ts_15m is None or ts_15m.empty:
                 st.error("No historical 15m data available up to selected time")
                 return
@@ -196,7 +218,6 @@ def run_check(historical_end_time=None, test_dd_limit=None, test_risk_pct=None):
 
     max_risk_dollars = (dd_limit * risk_of_dd_pct / 100.0) if dd_limit else 50.0
 
-    # Show test parameters in historical mode
     if is_historical:
         st.write(f"Test DD limit: ${dd_limit:.2f}")
         st.write(f"Test risk %: {risk_of_dd_pct}%")
@@ -466,21 +487,21 @@ with st.expander("Historical Test Mode (optional backtesting)", expanded=False):
         else:
             run_check(historical_end_time=test_datetime, test_dd_limit=test_dd_limit, test_risk_pct=test_risk_pct)
 
-    # Download button (only active after a historical run)
+    # Download button
     if 'last_ts_15m' in st.session_state and st.session_state['last_ts_15m'] is not None:
         df = st.session_state['last_ts_15m']
         csv_buffer = io.StringIO()
         df.to_csv(csv_buffer)
         csv_data = csv_buffer.getvalue()
 
-        filename = f"gold_15m_snapshot_{st.session_state.get('last_test_datetime', 'unknown').strftime('%Y%m%d_%H%M')}.csv"
+        filename = f"gold_15m_snapshot_{st.session_state.get('last_test_datetime', 'unknown').strftime('%Y%m%d_%H%M')}.csv" if st.session_state.get('last_test_datetime') else "gold_15m_snapshot.csv"
 
         st.download_button(
             label="Download Twelve Data Snapshot (CSV)",
             data=csv_data,
             file_name=filename,
             mime="text/csv",
-            help="Download the exact 15m data slice that was fed to the AIs for this test"
+            help="Download the exact 15m data slice used for this test"
         )
     else:
         st.info("Run a historical test first to enable download.")
