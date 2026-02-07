@@ -52,10 +52,9 @@ def fetch_15m(target_end_time=None, outputsize=200):
             target_pd = pd.Timestamp(target_end_time).tz_localize(None)
             df.index = df.index.tz_localize(None) if df.index.tz is not None else df.index
             df = df[df.index <= target_pd]
-            # Fix: Sort ascending so tail() shows newest candles
             df = df.sort_index(ascending=True)
             if df.empty:
-                st.warning(f"No 15m candles ≤ {target_end_time} — try later time or larger outputsize")
+                st.warning(f"No 15m candles ≤ {target_end_time}")
         return df
     except Exception as e:
         st.warning(f"15m fetch failed: {str(e)}")
@@ -70,7 +69,7 @@ def fetch_1h(target_end_time=None, outputsize=100):
             target_pd = pd.Timestamp(target_end_time).tz_localize(None)
             df.index = df.index.tz_localize(None) if df.index.tz is not None else df.index
             df = df[df.index <= target_pd]
-            df = df.sort_index(ascending=True)  # Fix: ascending sort
+            df = df.sort_index(ascending=True)
         return df
     except Exception as e:
         st.warning(f"1h fetch failed: {str(e)}")
@@ -141,24 +140,21 @@ def run_check(historical_end_time=None):
             ts_15m = fetch_15m(target_end_time=historical_end_time)
             ts_1h  = fetch_1h(target_end_time=historical_end_time)
             if ts_15m is None or ts_15m.empty:
-                st.error("No historical 15m data available up to selected time — check date/time")
+                st.error("No historical 15m data available up to selected time")
                 return
             price = ts_15m['close'].iloc[-1]
             current_time_str = historical_end_time.strftime('%Y-%m-%d %H:%M UTC')
             st.info(f"Historical test mode: simulating market at {current_time_str}")
             st.write(f"Simulated current price: ${price:.2f}")
             if len(ts_15m) > 0:
-                # Safe debug columns
                 debug_cols = ['close']
                 for col in ['rsi', 'ema_50', 'ema_200', 'atr']:
                     if col in ts_15m.columns:
                         debug_cols.append(col)
                 st.write(f"Number of candles available up to cutoff: {len(ts_15m)}")
                 st.write("First timestamp:", ts_15m.index[0])
-                st.write("Last timestamp (should be ≤ cutoff):", ts_15m.index[-1])
+                st.write("Last timestamp:", ts_15m.index[-1])
                 st.write("Last 5 candles (newest):", ts_15m.tail(5)[debug_cols])
-            else:
-                st.warning("No candles after slicing")
         else:
             price = get_live_price()
             ts_15m = fetch_15m()
@@ -202,6 +198,14 @@ EMA200 (1h): {ema200_1h:.2f}
 Recent support/resistance fractals: {', '.join([f"{t}@{p}" for t,p in levels[-8:]]) or 'None'}
 
 Account risk limit: max ${max_risk_dollars:.2f} loss per trade (preferred)
+
+Verdict rules (strict):
+- ELITE: win prob ≥80%, exceptional setup
+- HIGH_CONV: win prob ≥65%, strong edge
+- MODERATE: win prob 50–65%
+- LOW_EDGE: win prob <50%
+- NO_EDGE: no valid setup or prob too low
+Always base verdict on your estimated_win_prob — do not assign HIGH_CONV or ELITE to low-prob setups.
 
 Propose high-probability setups with confirmation entries only.
 Respond **ONLY** with valid JSON:
@@ -357,7 +361,7 @@ Respond **ONLY** with valid JSON:
     with col3: st.markdown(format_verdict(c_p, "ChatGPT",  lot_size, lot_note), unsafe_allow_html=True)
 
     # ─── CONSENSUS & TELEGRAM ──────────────────────────────────────────────────
-    high_verdicts = [p for p in [g_p, k_p, c_p] if p["verdict"] in ["ELITE", "HIGH_CONV"]]
+    high_verdicts = [p for p in [g_p, k_p, c_p] if p["verdict"] in ["ELITE", "HIGH_CONV"] and p.get("estimated_win_prob", 0) >= 60]
     if len(high_verdicts) >= 2:
         directions = [p["direction"] for p in high_verdicts if p["direction"] != "NEUTRAL"]
         if len(set(directions)) == 1 and directions:
@@ -397,7 +401,7 @@ Respond **ONLY** with valid JSON:
         else:
             st.info("Direction mismatch — no alert")
     else:
-        st.info("No strong consensus — no alert")
+        st.info("No strong consensus (or low-prob verdicts filtered) — no alert")
 
 # ─── UI ─────────────────────────────────────────────────────────────────────
 st.set_page_config(page_title="Gold Sentinel", page_icon="🥇", layout="wide")
