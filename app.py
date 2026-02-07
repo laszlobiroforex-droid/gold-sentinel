@@ -42,29 +42,31 @@ def get_live_price():
     except:
         return None
 
-def fetch_15m(end_time=None, outputsize=120):
+def fetch_15m(target_end_time=None, outputsize=200):
     try:
-        params = {"symbol": "XAU/USD", "interval": "15min", "outputsize": outputsize}
-        if end_time:
-            params["end"] = (end_time + timedelta(minutes=15)).isoformat()
-            params["start"] = (end_time - timedelta(hours=6)).isoformat()
-        ts = td.time_series(**params)
+        ts = td.time_series(symbol="XAU/USD", interval="15min", outputsize=outputsize)
         ts = ts.with_rsi().with_ema(time_period=200).with_ema(time_period=50).with_atr(time_period=14)
-        return ts.as_pandas()
+        df = ts.as_pandas()
+        if target_end_time:
+            # Slice to only include candles up to (and including) the target time
+            df = df[df.index <= target_end_time]
+            if df.empty:
+                st.warning(f"No 15m candles before or at {target_end_time} — check date/time or increase outputsize")
+        return df
     except Exception as e:
         st.warning(f"15m fetch failed: {str(e)}")
         return None
 
-def fetch_1h(end_time=None, outputsize=60):
+def fetch_1h(target_end_time=None, outputsize=100):
     try:
-        params = {"symbol": "XAU/USD", "interval": "1h", "outputsize": outputsize}
-        if end_time:
-            params["end"] = (end_time + timedelta(hours=1)).isoformat()
-            params["start"] = (end_time - timedelta(days=2)).isoformat()
-        ts = td.time_series(**params)
+        ts = td.time_series(symbol="XAU/USD", interval="1h", outputsize=outputsize)
         ts = ts.with_ema(time_period=200)
-        return ts.as_pandas()
-    except:
+        df = ts.as_pandas()
+        if target_end_time:
+            df = df[df.index <= target_end_time]
+        return df
+    except Exception as e:
+        st.warning(f"1h fetch failed: {str(e)}")
         return None
 
 # ─── PARSE AI OUTPUT ───────────────────────────────────────────────────────
@@ -129,16 +131,16 @@ def run_check(historical_end_time=None):
 
     with st.spinner("Fetching data..."):
         if is_historical:
-            ts_15m = fetch_15m(end_time=historical_end_time)
-            ts_1h  = fetch_1h(end_time=historical_end_time)
+            ts_15m = fetch_15m(target_end_time=historical_end_time)
+            ts_1h  = fetch_1h(target_end_time=historical_end_time)
             if ts_15m is None or ts_15m.empty:
-                st.error("No historical 15m data returned for selected time")
+                st.error("No historical 15m data available up to selected time")
                 return
             price = ts_15m['close'].iloc[-1]
             current_time_str = historical_end_time.strftime('%Y-%m-%d %H:%M UTC')
-            st.info(f"Historical mode: simulating {current_time_str} | Last price used: ${price:.2f}")
-            if len(ts_15m) > 0:
-                st.write("Last 3 candles:", ts_15m.tail(3)[['close', 'rsi', 'ema_50', 'ema_200', 'atr']])
+            st.info(f"Historical test mode: simulating market at {current_time_str}")
+            st.write(f"Simulated current price: ${price:.2f}")
+            st.write("Last 5 candles used (up to selected time):", ts_15m.tail(5)[['close', 'rsi', 'ema_50', 'ema_200', 'atr']])
         else:
             price = get_live_price()
             ts_15m = fetch_15m()
@@ -152,7 +154,7 @@ def run_check(historical_end_time=None):
     rsi = latest_15m.get('rsi', 50.0)
     atr = latest_15m.get('atr', 10.0)
     ema200_15m = latest_15m.get('ema_200', price)
-    ema50_15m  = latest_15m.get('ema_50',  price)
+    ema50_15m  = latest_15m.get('ema_50', price)
 
     ema200_1h = ts_1h.iloc[-1].get('ema_200', price) if ts_1h is not None and not ts_1h.empty else price
 
@@ -183,7 +185,7 @@ Recent support/resistance fractals: {', '.join([f"{t}@{p}" for t,p in levels[-8:
 
 Account risk limit: max ${max_risk_dollars:.2f} loss per trade (preferred)
 
-Propose high-prob setups with confirmation entries only.
+Propose high-probability setups with confirmation entries only.
 Respond **ONLY** with valid JSON:
 
 {{
@@ -235,7 +237,7 @@ Respond **ONLY** with valid JSON:
     k_p = parse_ai_output(k_raw)
     c_p = parse_ai_output(c_raw)
 
-    # Strict lot calculation
+    # Strict lot calculation (Python overrides any AI suggestion)
     best_entry = best_sl = None
     for p in [g_p, k_p, c_p]:
         e = p.get("entry_price") or p.get("entry")
@@ -336,7 +338,7 @@ Respond **ONLY** with valid JSON:
     with col2: st.markdown(format_verdict(k_p, "Grok",     lot_size, lot_note), unsafe_allow_html=True)
     with col3: st.markdown(format_verdict(c_p, "ChatGPT",  lot_size, lot_note), unsafe_allow_html=True)
 
-    # Consensus logic (same as before)
+    # ─── CONSENSUS & TELEGRAM ──────────────────────────────────────────────────
     high_verdicts = [p for p in [g_p, k_p, c_p] if p["verdict"] in ["ELITE", "HIGH_CONV"]]
     if len(high_verdicts) >= 2:
         directions = [p["direction"] for p in high_verdicts if p["direction"] != "NEUTRAL"]
@@ -365,7 +367,7 @@ Respond **ONLY** with valid JSON:
                 msg = (
                     f"**Consensus High Conviction ({len(high_verdicts)} AIs)**\n"
                     f"Direction: {direction}\n"
-                    f"Entry (lowest): LIMIT @ ${consensus_entry:.2f}\n"
+                    f"Entry (lowest/safest): LIMIT @ ${consensus_entry:.2f}\n"
                     f"SL (tightest): ${consensus_sl:.2f}\n"
                     f"TP (median): ${consensus_tp if isinstance(consensus_tp, (int, float)) else consensus_tp:.2f}\n"
                     f"Lot size: {lot_size:.2f} ({lot_note})\n"
