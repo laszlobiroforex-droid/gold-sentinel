@@ -8,6 +8,7 @@ from openai import OpenAI
 import requests
 import numpy as np
 import pandas as pd
+import io
 
 # ─── CONFIG ────────────────────────────────────────────────────────────────
 CHECK_INTERVAL_MIN = 30
@@ -155,6 +156,8 @@ def run_check(historical_end_time=None, test_dd_limit=None, test_risk_pct=None):
                 st.write("First timestamp:", ts_15m.index[0])
                 st.write("Last timestamp (newest ≤ cutoff):", ts_15m.index[-1])
                 st.write("Last 5 candles (newest):", ts_15m.tail(5)[debug_cols])
+            else:
+                st.warning("No candles after slicing")
         else:
             price = get_live_price()
             ts_15m = fetch_15m()
@@ -163,6 +166,10 @@ def run_check(historical_end_time=None, test_dd_limit=None, test_risk_pct=None):
                 st.error("Failed to fetch live price")
                 return
             current_time_str = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
+
+    # Store ts_15m in session state for download button
+    st.session_state['last_ts_15m'] = ts_15m
+    st.session_state['last_test_datetime'] = historical_end_time if is_historical else None
 
     latest_15m = ts_15m.iloc[-1]
     rsi = latest_15m.get('rsi', 50.0)
@@ -269,7 +276,7 @@ Respond **ONLY** with valid JSON:
     k_p = parse_ai_output(k_raw)
     c_p = parse_ai_output(c_raw)
 
-    # Strict lot calculation (using the test or live values)
+    # Strict lot calculation
     best_entry = best_sl = None
     for p in [g_p, k_p, c_p]:
         e = p.get("entry_price") or p.get("entry")
@@ -458,6 +465,25 @@ with st.expander("Historical Test Mode (optional backtesting)", expanded=False):
             st.error("Cannot test future or current time — pick a past moment.")
         else:
             run_check(historical_end_time=test_datetime, test_dd_limit=test_dd_limit, test_risk_pct=test_risk_pct)
+
+    # Download button (only active after a historical run)
+    if 'last_ts_15m' in st.session_state and st.session_state['last_ts_15m'] is not None:
+        df = st.session_state['last_ts_15m']
+        csv_buffer = io.StringIO()
+        df.to_csv(csv_buffer)
+        csv_data = csv_buffer.getvalue()
+
+        filename = f"gold_15m_snapshot_{st.session_state.get('last_test_datetime', 'unknown').strftime('%Y%m%d_%H%M')}.csv"
+
+        st.download_button(
+            label="Download Twelve Data Snapshot (CSV)",
+            data=csv_data,
+            file_name=filename,
+            mime="text/csv",
+            help="Download the exact 15m data slice that was fed to the AIs for this test"
+        )
+    else:
+        st.info("Run a historical test first to enable download.")
 
 # ─── AUTO / MANUAL CONTROLS ────────────────────────────────────────────────
 if "last_check_time" not in st.session_state:
